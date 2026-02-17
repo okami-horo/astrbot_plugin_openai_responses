@@ -1,4 +1,5 @@
-name: openai-responses-provider
+name: astrbot_plugin_openai_responses
+display_name: OpenAI Responses API Provider
 desc: OpenAI Responses API Provider
 version: 0.1.2
 author: community
