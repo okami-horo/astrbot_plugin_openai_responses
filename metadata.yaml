@@ -1,0 +1,5 @@
+name: openai-responses-provider
+desc: OpenAI Responses API Provider
+version: 0.1.2
+author: community
+repo: https://github.com/yourname/astrbot_plugin_openai_responses
