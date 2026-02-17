@@ -55,11 +55,15 @@ class _ResponsesStreamProcessor:
         self.model = model
         self.response_id: str | None = None
         self.accumulated_text = ""
+        self.accumulated_refusal = ""
         self.accumulated_reasoning = ""
         self.usage: dict[str, Any] | None = None
 
-        self.tool_calls: list[dict[str, Any]] = []
-        self.current_tool_call: dict[str, Any] | None = None
+        self.tool_calls_by_id: dict[str, dict[str, Any]] = {}
+        self.tool_call_order: list[str] = []
+        self.active_tool_call_ids: list[str] = []
+        self.tool_call_item_map: dict[str, str] = {}
+        self.tool_call_output_index_map: dict[int, str] = {}
 
     @staticmethod
     def _convert_usage_to_token_usage(
@@ -79,6 +83,226 @@ class _ResponsesStreamProcessor:
             output=max(output_tokens, 0),
         )
 
+    @staticmethod
+    def _normalize_output_index(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    def _append_text_chunk(self, chunks: list[LLMResponse], text: str) -> None:
+        if not text:
+            return
+        self.accumulated_text += text
+        chunks.append(
+            LLMResponse(
+                role="assistant",
+                result_chain=MessageChain(chain=[Comp.Plain(text)]),
+                is_chunk=True,
+                id=self.response_id,
+            )
+        )
+
+    def _append_refusal_text(
+        self,
+        chunks: list[LLMResponse],
+        text: str,
+        *,
+        stream_chunk: bool = True,
+    ) -> None:
+        if not text:
+            return
+        self.accumulated_refusal += text
+        if stream_chunk:
+            chunks.append(
+                LLMResponse(
+                    role="assistant",
+                    result_chain=MessageChain(chain=[Comp.Plain(text)]),
+                    is_chunk=True,
+                    id=self.response_id,
+                )
+            )
+
+    def _ensure_tool_call(self, call_id: str) -> dict[str, Any]:
+        tool_call = self.tool_calls_by_id.get(call_id)
+        if tool_call is None:
+            tool_call = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "",
+                    "arguments": "",
+                },
+            }
+            self.tool_calls_by_id[call_id] = tool_call
+            self.tool_call_order.append(call_id)
+        return tool_call
+
+    def _mark_tool_call_active(self, call_id: str) -> None:
+        if call_id in self.active_tool_call_ids:
+            self.active_tool_call_ids.remove(call_id)
+        self.active_tool_call_ids.append(call_id)
+
+    def _mark_tool_call_done(self, call_id: str) -> None:
+        if call_id in self.active_tool_call_ids:
+            self.active_tool_call_ids.remove(call_id)
+
+    def _register_tool_call(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        item_id: str | None = None,
+        output_index: int | None = None,
+        arguments: str | None = None,
+    ) -> None:
+        tool_call = self._ensure_tool_call(call_id)
+        if name:
+            tool_call["function"]["name"] = name
+        if arguments:
+            tool_call["function"]["arguments"] = arguments
+        if item_id:
+            self.tool_call_item_map[item_id] = call_id
+        if output_index is not None:
+            self.tool_call_output_index_map[output_index] = call_id
+        self._mark_tool_call_active(call_id)
+
+    def _append_tool_call_arguments(self, call_id: str, delta_args: str) -> None:
+        if not delta_args:
+            return
+        tool_call = self._ensure_tool_call(call_id)
+        curr_args = tool_call["function"].get("arguments", "")
+        tool_call["function"]["arguments"] = f"{curr_args}{delta_args}"
+        self._mark_tool_call_active(call_id)
+
+    def _resolve_tool_call_id(self, event_data: dict[str, Any]) -> str | None:
+        call_id = event_data.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            return call_id
+
+        item_id = event_data.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            mapped_call_id = self.tool_call_item_map.get(item_id)
+            if mapped_call_id:
+                return mapped_call_id
+
+        output_index = self._normalize_output_index(event_data.get("output_index"))
+        if output_index is not None:
+            mapped_call_id = self.tool_call_output_index_map.get(output_index)
+            if mapped_call_id:
+                return mapped_call_id
+
+        candidate_id = event_data.get("id")
+        if isinstance(candidate_id, str) and candidate_id in self.tool_calls_by_id:
+            return candidate_id
+
+        if self.active_tool_call_ids:
+            return self.active_tool_call_ids[-1]
+        if self.tool_call_order:
+            return self.tool_call_order[-1]
+        return None
+
+    def _finalize_tool_call(
+        self,
+        *,
+        call_id: str,
+        arguments: str | None = None,
+    ) -> None:
+        tool_call = self._ensure_tool_call(call_id)
+        if isinstance(arguments, str) and arguments:
+            tool_call["function"]["arguments"] = arguments
+        self._mark_tool_call_done(call_id)
+
+    @staticmethod
+    def _extract_refusal_text_from_content(content: Any) -> str:
+        if not isinstance(content, list):
+            return ""
+        refusal_text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type != "refusal" and "refusal" not in part:
+                continue
+            refusal = part.get("refusal")
+            if isinstance(refusal, str) and refusal:
+                refusal_text_parts.append(refusal)
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                refusal_text_parts.append(text)
+        return "".join(refusal_text_parts)
+
+    @classmethod
+    def _extract_refusal_text_from_item(cls, item: dict[str, Any]) -> str:
+        refusal_text_parts: list[str] = []
+        item_type = str(item.get("type") or "")
+        if item_type == "refusal" or "refusal" in item:
+            refusal = item.get("refusal")
+            if isinstance(refusal, str) and refusal:
+                refusal_text_parts.append(refusal)
+            else:
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    refusal_text_parts.append(text)
+
+        content = item.get("content")
+        refusal_from_content = cls._extract_refusal_text_from_content(content)
+        if refusal_from_content:
+            refusal_text_parts.append(refusal_from_content)
+
+        return "".join(refusal_text_parts)
+
+    @classmethod
+    def _extract_refusal_text_from_response(cls, response_obj: dict[str, Any]) -> str:
+        refusal_text_parts: list[str] = []
+        output = response_obj.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                refusal_text = cls._extract_refusal_text_from_item(item)
+                if refusal_text:
+                    refusal_text_parts.append(refusal_text)
+        return "".join(refusal_text_parts)
+
+    def _ingest_tool_calls_from_response(self, response_obj: dict[str, Any]) -> None:
+        output = response_obj.get("output")
+        if not isinstance(output, list):
+            return
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "function_call":
+                continue
+
+            item_id = item.get("id")
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                if isinstance(item_id, str) and item_id:
+                    call_id = item_id
+                else:
+                    call_id = f"call_{uuid.uuid4().hex[:24]}"
+
+            name = item.get("name")
+            if not isinstance(name, str):
+                name = ""
+
+            output_index = self._normalize_output_index(item.get("output_index"))
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = None
+
+            self._register_tool_call(
+                call_id=call_id,
+                name=name,
+                item_id=item_id if isinstance(item_id, str) else None,
+                output_index=output_index,
+                arguments=arguments,
+            )
+            self._mark_tool_call_done(call_id)
+
     def handle_event(
         self,
         event_type: str,
@@ -97,15 +321,7 @@ class _ResponsesStreamProcessor:
         if event_type == "response.output_text.delta":
             delta_text = event_data.get("delta")
             if isinstance(delta_text, str) and delta_text:
-                self.accumulated_text += delta_text
-                chunks.append(
-                    LLMResponse(
-                        role="assistant",
-                        result_chain=MessageChain(chain=[Comp.Plain(delta_text)]),
-                        is_chunk=True,
-                        id=self.response_id,
-                    )
-                )
+                self._append_text_chunk(chunks, delta_text)
             return chunks
 
         if event_type == "response.content_part.delta":
@@ -113,15 +329,23 @@ class _ResponsesStreamProcessor:
             if isinstance(delta, dict):
                 text = delta.get("text")
                 if isinstance(text, str) and text:
-                    self.accumulated_text += text
-                    chunks.append(
-                        LLMResponse(
-                            role="assistant",
-                            result_chain=MessageChain(chain=[Comp.Plain(text)]),
-                            is_chunk=True,
-                            id=self.response_id,
-                        )
-                    )
+                    self._append_text_chunk(chunks, text)
+                refusal = delta.get("refusal")
+                if isinstance(refusal, str) and refusal:
+                    self._append_refusal_text(chunks, refusal)
+            return chunks
+
+        if event_type in {"response.refusal.delta", "response.output_refusal.delta"}:
+            delta_text = event_data.get("delta")
+            if isinstance(delta_text, str) and delta_text:
+                self._append_refusal_text(chunks, delta_text)
+            return chunks
+
+        if event_type in {"response.refusal.done", "response.output_refusal.done"}:
+            if not self.accumulated_refusal:
+                refusal = event_data.get("refusal")
+                if isinstance(refusal, str) and refusal:
+                    self._append_refusal_text(chunks, refusal, stream_chunk=False)
             return chunks
 
         if event_type in {
@@ -145,28 +369,75 @@ class _ResponsesStreamProcessor:
         if event_type == "response.output_item.added":
             item = event_data.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
-                self.current_tool_call = {
-                    "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name", ""),
-                        "arguments": "",
-                    },
-                }
+                item_id = item.get("id")
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    if isinstance(item_id, str) and item_id:
+                        call_id = item_id
+                    else:
+                        call_id = f"call_{uuid.uuid4().hex[:24]}"
+                name = item.get("name")
+                if not isinstance(name, str):
+                    name = ""
+                output_index = self._normalize_output_index(item.get("output_index"))
+                if output_index is None:
+                    output_index = self._normalize_output_index(
+                        event_data.get("output_index")
+                    )
+                arguments = item.get("arguments")
+                if not isinstance(arguments, str):
+                    arguments = None
+                self._register_tool_call(
+                    call_id=call_id,
+                    name=name,
+                    item_id=item_id if isinstance(item_id, str) else None,
+                    output_index=output_index,
+                    arguments=arguments,
+                )
+            return chunks
+
+        if event_type == "response.output_item.done":
+            item = event_data.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        call_id = self.tool_call_item_map.get(item_id, item_id)
+                    else:
+                        call_id = self._resolve_tool_call_id(event_data)
+                if isinstance(call_id, str) and call_id:
+                    arguments = item.get("arguments")
+                    if not isinstance(arguments, str):
+                        arguments = None
+                    self._finalize_tool_call(call_id=call_id, arguments=arguments)
             return chunks
 
         if event_type == "response.function_call_arguments.delta":
-            if self.current_tool_call is None:
+            call_id = self._resolve_tool_call_id(event_data)
+            if call_id is None:
+                logger.warning(
+                    "Received function_call_arguments.delta but no tool call can be resolved. event=%s",
+                    event_data,
+                )
                 return chunks
             delta_args = event_data.get("delta")
             if isinstance(delta_args, str) and delta_args:
-                self.current_tool_call["function"]["arguments"] += delta_args
+                self._append_tool_call_arguments(call_id, delta_args)
             return chunks
 
         if event_type == "response.function_call_arguments.done":
-            if self.current_tool_call is not None:
-                self.tool_calls.append(self.current_tool_call)
-                self.current_tool_call = None
+            call_id = self._resolve_tool_call_id(event_data)
+            if call_id is None:
+                logger.warning(
+                    "Received function_call_arguments.done but no tool call can be resolved. event=%s",
+                    event_data,
+                )
+                return chunks
+            arguments = event_data.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = None
+            self._finalize_tool_call(call_id=call_id, arguments=arguments)
             return chunks
 
         if event_type in {"response.completed", "response.done"}:
@@ -175,6 +446,17 @@ class _ResponsesStreamProcessor:
                 response_obj.get("usage"), dict
             ):
                 self.usage = response_obj["usage"]
+                self._ingest_tool_calls_from_response(response_obj)
+                if not self.accumulated_refusal:
+                    refusal_text = self._extract_refusal_text_from_response(
+                        response_obj
+                    )
+                    if refusal_text:
+                        self._append_refusal_text(
+                            chunks,
+                            refusal_text,
+                            stream_chunk=False,
+                        )
             elif isinstance(event_data.get("usage"), dict):
                 self.usage = event_data["usage"]
             return chunks
@@ -187,17 +469,25 @@ class _ResponsesStreamProcessor:
 
         if self.accumulated_text:
             llm_response.result_chain = MessageChain().message(self.accumulated_text)
+        elif self.accumulated_refusal:
+            llm_response.result_chain = MessageChain().message(self.accumulated_refusal)
 
         if self.accumulated_reasoning:
             llm_response.reasoning_content = self.accumulated_reasoning
 
-        if self.tool_calls:
+        ordered_tool_calls = [
+            self.tool_calls_by_id[call_id]
+            for call_id in self.tool_call_order
+            if call_id in self.tool_calls_by_id
+        ]
+
+        if ordered_tool_calls:
             if not tools_provided:
                 raise Exception("工具集未提供")
             tool_args: list[dict[str, Any]] = []
             tool_names: list[str] = []
             tool_ids: list[str] = []
-            for tool_call in self.tool_calls:
+            for tool_call in ordered_tool_calls:
                 if not isinstance(tool_call, dict):
                     continue
                 call_id = str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
@@ -231,7 +521,8 @@ class _ResponsesStreamProcessor:
         llm_response.raw_completion = {
             "id": self.response_id,
             "usage": self.usage,
-            "tool_calls": self.tool_calls,
+            "tool_calls": ordered_tool_calls,
+            "refusal": self.accumulated_refusal,
         }
         return llm_response
 
@@ -258,7 +549,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             for key in list(self.custom_headers.keys()):
                 self.custom_headers[key] = str(self.custom_headers[key])
 
-        self.api_base = str(provider_config.get("api_base", "https://api.openai.com/v1"))
+        self.api_base = str(
+            provider_config.get("api_base", "https://api.openai.com/v1")
+        )
         self.proxy = str(provider_config.get("proxy", "") or "")
 
         self._http_client: httpx.AsyncClient | None = None
@@ -346,7 +639,14 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                             refusal = part.get("text", "")
                         converted.append({"type": "refusal", "refusal": str(refusal)})
                     else:
-                        converted.append({"type": "input_text", "text": str(part.get("refusal") or part.get("text") or "")})
+                        converted.append(
+                            {
+                                "type": "input_text",
+                                "text": str(
+                                    part.get("refusal") or part.get("text") or ""
+                                ),
+                            }
+                        )
                     continue
 
                 if part_type in {"image_url", "input_image"}:
@@ -359,7 +659,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     if role == "assistant":
                         converted.append(_text_item("[image]"))
                     else:
-                        converted.append({"type": "input_image", "image_url": str(image_url)})
+                        converted.append(
+                            {"type": "input_image", "image_url": str(image_url)}
+                        )
                     continue
 
                 # Pass-through for already-valid response parts when possible
@@ -451,11 +753,15 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     func_name = func.get("name") or ""
                     if not func_name:
                         func_name = f"unknown_function_{uuid.uuid4().hex[:8]}"
-                        logger.warning("tool_call name is empty, inferred as: %s", func_name)
+                        logger.warning(
+                            "tool_call name is empty, inferred as: %s", func_name
+                        )
 
                     arguments = func.get("arguments", "{}")
                     if not isinstance(arguments, str):
-                        arguments = json.dumps(arguments, ensure_ascii=False, default=str)
+                        arguments = json.dumps(
+                            arguments, ensure_ascii=False, default=str
+                        )
 
                     input_items.append(
                         {
@@ -544,7 +850,11 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             request_body["reasoning"] = {"effort": normalized_effort}
 
         if response_format is not None:
-            fmt_type = response_format.get("type") if isinstance(response_format, dict) else None
+            fmt_type = (
+                response_format.get("type")
+                if isinstance(response_format, dict)
+                else None
+            )
             if fmt_type == "json_object":
                 request_body["text"] = {"format": {"type": "json_object"}}
             elif fmt_type == "json_schema":
@@ -598,24 +908,26 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 )
 
             current_event_type: str | None = None
-            async for raw_line in response.aiter_lines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if line.startswith("event:"):
-                    current_event_type = line[6:].strip()
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
+            current_data_lines: list[str] = []
 
+            def _parse_event_data(
+                *,
+                event_type_hint: str | None,
+                data_lines: list[str],
+            ) -> tuple[str, dict[str, Any]] | None:
+                if not data_lines:
+                    return None
+                data_str = "\n".join(data_lines)
+                if data_str == "[DONE]":
+                    return ("[DONE]", {})
                 try:
                     event_data = json.loads(data_str)
                 except json.JSONDecodeError:
-                    logger.warning("Responses SSE JSON decode failed: %s", data_str[:200])
-                    continue
+                    logger.warning(
+                        "Responses SSE JSON decode failed: %s",
+                        data_str[:200],
+                    )
+                    return None
 
                 if isinstance(event_data, dict) and "error" in event_data:
                     err = event_data.get("error", {})
@@ -631,11 +943,50 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     )
 
                 if not isinstance(event_data, dict):
-                    continue
-                event_type = current_event_type or str(event_data.get("type") or "")
+                    return None
+                event_type = event_type_hint or str(event_data.get("type") or "")
                 if not event_type:
+                    return None
+                return event_type, event_data
+
+            def _flush_current_event() -> tuple[str, dict[str, Any]] | None:
+                nonlocal current_event_type, current_data_lines
+                parsed = _parse_event_data(
+                    event_type_hint=current_event_type,
+                    data_lines=current_data_lines,
+                )
+                current_event_type = None
+                current_data_lines = []
+                return parsed
+
+            async for raw_line in response.aiter_lines():
+                line = raw_line.rstrip("\r")
+                if not line:
+                    parsed = _flush_current_event()
+                    if parsed is None:
+                        continue
+                    if parsed[0] == "[DONE]":
+                        break
+                    yield parsed
                     continue
-                yield event_type, event_data
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    current_event_type = line[6:].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_segment = line[5:]
+                    if data_segment.startswith(" "):
+                        data_segment = data_segment[1:]
+                    current_data_lines.append(data_segment)
+                    continue
+                # Ignore non-data fields like id/retry.
+                if line.startswith("id:") or line.startswith("retry:"):
+                    continue
+
+            parsed = _flush_current_event()
+            if parsed and parsed[0] != "[DONE]":
+                yield parsed
 
     async def _query_stream(
         self,
@@ -652,7 +1003,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             reasoning_effort=reasoning_effort,
             response_format=response_format,
         )
-        processor = _ResponsesStreamProcessor(model=str(payloads.get("model") or self.get_model()))
+        processor = _ResponsesStreamProcessor(
+            model=str(payloads.get("model") or self.get_model())
+        )
 
         async for event_type, event_data in self._iter_responses_sse(
             request_body=request_body,
@@ -665,7 +1018,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
     def _finally_convert_payload(self, payloads: dict) -> None:
         for message in payloads.get("messages", []):
-            if message.get("role") == "assistant" and isinstance(message.get("content"), list):
+            if message.get("role") == "assistant" and isinstance(
+                message.get("content"), list
+            ):
                 reasoning_content = ""
                 new_content = []
                 for part in message["content"]:
@@ -717,7 +1072,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         self._finally_convert_payload(payloads)
         return payloads, context_query
 
-    def _remove_images_from_context(self, contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _remove_images_from_context(
+        self, contexts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         new_contexts: list[dict[str, Any]] = []
         for context in contexts:
             if "content" in context and isinstance(context["content"], list):
@@ -814,7 +1171,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         retry_cnt: int,
         max_retries: int,
         image_fallback_used: bool = False,
-    ) -> tuple[bool, str, list[str], dict[str, Any], list[dict[str, Any]], ToolSet | None, bool]:
+    ) -> tuple[
+        bool, str, list[str], dict[str, Any], list[dict[str, Any]], ToolSet | None, bool
+    ]:
         """Return (stop, chosen_key, available_keys, payloads, context, tools, image_fallback_used)."""
         candidates = self._extract_error_text_candidates(e)
         joined = "\n".join(candidates)
@@ -888,10 +1247,15 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 image_fallback_used,
             )
 
-        if "The model is not a VLM" in joined or self._is_content_moderated_upload_error(e):
+        if (
+            "The model is not a VLM" in joined
+            or self._is_content_moderated_upload_error(e)
+        ):
             if image_fallback_used or not self._context_contains_image(context_query):
                 raise e
-            logger.warning("Image input rejected by upstream, retrying with text-only context.")
+            logger.warning(
+                "Image input rejected by upstream, retrying with text-only context."
+            )
             context_query = self._remove_images_from_context(context_query)
             payloads["messages"] = context_query
             return (
@@ -995,6 +1359,12 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             if last_exception is None:
                 raise Exception("Unknown error")
             raise last_exception
+
+        completion_text = llm_response.completion_text
+        has_text = isinstance(completion_text, str) and bool(completion_text.strip())
+        if not has_text and not llm_response.tools_call_args:
+            logger.error("Responses API parsed empty completion without tool calls.")
+            raise Exception("API 返回的 completion 为空且无工具调用。")
         return llm_response
 
     async def text_chat_stream(
@@ -1067,7 +1437,9 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 )
 
         if retry_cnt == max_retries - 1:
-            logger.error("Responses API streaming call failed after %s retries.", max_retries)
+            logger.error(
+                "Responses API streaming call failed after %s retries.", max_retries
+            )
             if last_exception is None:
                 raise Exception("Unknown error")
             raise last_exception
