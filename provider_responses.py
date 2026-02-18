@@ -91,18 +91,71 @@ class _ResponsesStreamProcessor:
             return int(value)
         return None
 
-    def _append_text_chunk(self, chunks: list[LLMResponse], text: str) -> None:
+    def _append_text_chunk(
+        self,
+        chunks: list[LLMResponse],
+        text: str,
+        *,
+        stream_chunk: bool = True,
+    ) -> None:
         if not text:
             return
         self.accumulated_text += text
-        chunks.append(
-            LLMResponse(
-                role="assistant",
-                result_chain=MessageChain(chain=[Comp.Plain(text)]),
-                is_chunk=True,
-                id=self.response_id,
+        if stream_chunk:
+            chunks.append(
+                LLMResponse(
+                    role="assistant",
+                    result_chain=MessageChain(chain=[Comp.Plain(text)]),
+                    is_chunk=True,
+                    id=self.response_id,
+                )
             )
-        )
+
+    @staticmethod
+    def _extract_text_from_content(content: Any) -> str:
+        if not isinstance(content, list):
+            return ""
+        text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type == "refusal":
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        return "".join(text_parts)
+
+    @classmethod
+    def _extract_text_from_item(cls, item: dict[str, Any]) -> str:
+        text_parts: list[str] = []
+        item_type = str(item.get("type") or "")
+        if item_type in {"output_text", "text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        content = item.get("content")
+        content_text = cls._extract_text_from_content(content)
+        if content_text:
+            text_parts.append(content_text)
+        return "".join(text_parts)
+
+    @classmethod
+    def _extract_text_from_response(cls, response_obj: dict[str, Any]) -> str:
+        text_parts: list[str] = []
+        output = response_obj.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                text = cls._extract_text_from_item(item)
+                if text:
+                    text_parts.append(text)
+        output_text = response_obj.get("output_text")
+        if isinstance(output_text, str) and output_text:
+            text_parts.append(output_text)
+        return "".join(text_parts)
 
     def _append_refusal_text(
         self,
@@ -447,6 +500,25 @@ class _ResponsesStreamProcessor:
             ):
                 self.usage = response_obj["usage"]
                 self._ingest_tool_calls_from_response(response_obj)
+                final_text = self._extract_text_from_response(response_obj)
+                if final_text:
+                    if not self.accumulated_text:
+                        self._append_text_chunk(
+                            chunks,
+                            final_text,
+                            stream_chunk=False,
+                        )
+                    elif final_text != self.accumulated_text:
+                        if final_text.startswith(self.accumulated_text):
+                            missing = final_text[len(self.accumulated_text) :]
+                            if missing:
+                                self._append_text_chunk(
+                                    chunks,
+                                    missing,
+                                    stream_chunk=False,
+                                )
+                        elif len(final_text) > len(self.accumulated_text):
+                            self.accumulated_text = final_text
                 if not self.accumulated_refusal:
                     refusal_text = self._extract_refusal_text_from_response(
                         response_obj
@@ -581,6 +653,21 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
     def _responses_url(self) -> str:
         return self.api_base.rstrip("/") + "/responses"
+
+    @staticmethod
+    def _normalize_tool_output_text(content: str) -> str:
+        stripped = content.strip()
+        if not stripped or "\\" not in content:
+            return content
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return content
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False, default=str)
+        if isinstance(parsed, str):
+            return parsed
+        return str(parsed)
 
     @staticmethod
     def _normalize_reasoning_effort(value: Any) -> str | None:
@@ -783,7 +870,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     )
                 content = msg.get("content")
                 if isinstance(content, str):
-                    output = content
+                    output = self._normalize_tool_output_text(content)
                 elif content is None:
                     output = ""
                 else:

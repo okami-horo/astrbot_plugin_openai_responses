@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from astrbot.core.agent.tool import FunctionTool, ToolSet
@@ -91,6 +93,36 @@ def test_convert_chat_messages_to_responses_input_maps_roles_and_multimodal_and_
     assert input_items[4]["type"] == "function_call_output"
     assert input_items[4]["call_id"] == "call_1"
     assert input_items[4]["output"] == '{"ok":true}'
+
+
+def test_convert_chat_messages_to_responses_input_decodes_tool_json_unicode_escape():
+    provider = _make_provider()
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "test_tool", "arguments": '{"q":"x"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": '{"stdout":"\\u4f60\\u597d","stderr":"","exit_code":0}',
+        },
+    ]
+
+    input_items = provider._convert_chat_messages_to_responses_input(messages)
+    assert input_items[1]["type"] == "function_call_output"
+    assert "\\u4f60\\u597d" not in input_items[1]["output"]
+    assert json.loads(input_items[1]["output"]) == {
+        "stdout": "你好",
+        "stderr": "",
+        "exit_code": 0,
+    }
 
 
 def test_convert_openai_tools_to_responses_tools_flattens_schema():
@@ -409,3 +441,46 @@ async def test_iter_responses_sse_supports_multiline_data_event(monkeypatch):
             {"type": "response.output_text.delta", "delta": "Hello"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_query_stream_falls_back_to_text_from_response_completed(monkeypatch):
+    provider = _make_provider()
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 4,
+                        "output_tokens": 2,
+                    },
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "final text"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    final = outputs[-1]
+    assert final.role == "assistant"
+    assert final.completion_text == "final text"
+    assert final.tools_call_args == []
