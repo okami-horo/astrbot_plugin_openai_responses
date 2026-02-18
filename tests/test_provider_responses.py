@@ -539,6 +539,40 @@ async def test_text_chat_converts_pseudo_tool_call_without_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_text_chat_converts_pseudo_tool_call_even_if_not_in_allowlist(
+    monkeypatch,
+):
+    provider = _make_provider()
+    tools = _make_tool_set()
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        assert tool_set is tools
+        assert api_key == "test-key"
+        assert tool_choice_override is None
+        yield LLMResponse(
+            role="assistant",
+            completion_text='assistant to=functions.other_tool\n{"q":"x"}',
+        )
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    resp = await provider.text_chat(prompt="hello", func_tool=tools)
+
+    assert resp.role == "tool"
+    assert resp.tools_call_name == ["other_tool"]
+    assert resp.tools_call_args == [{"q": "x"}]
+    assert resp.completion_text == ""
+
+
+@pytest.mark.asyncio
 async def test_text_chat_retries_with_required_tool_choice_after_pseudo_parse_fail(
     monkeypatch,
 ):

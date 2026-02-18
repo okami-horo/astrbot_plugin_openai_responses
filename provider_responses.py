@@ -810,12 +810,13 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         allowed_tool_names: set[str],
     ) -> list[dict[str, Any]]:
         parsed_calls: list[dict[str, Any]] = []
-        if not text or not allowed_tool_names:
+        if not text:
             return parsed_calls
 
+        use_allowlist = bool(allowed_tool_names)
         for match in self._PSEUDO_TOOL_CALL_RE.finditer(text):
             tool_name = match.group(1)
-            if tool_name not in allowed_tool_names:
+            if use_allowlist and tool_name not in allowed_tool_names:
                 continue
             raw_json, _ = self._extract_json_object_after_index(text, match.end())
             if not raw_json:
@@ -884,6 +885,21 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             text,
             allowed_tool_names=allowed_tool_names,
         )
+        if not parsed_calls and self._PSEUDO_TOOL_CALL_RE.search(text):
+            if allowed_tool_names:
+                parsed_calls = self._parse_pseudo_tool_calls(
+                    text,
+                    allowed_tool_names=set(),
+                )
+                if parsed_calls:
+                    logger.warning(
+                        "Detected pseudo tool-call text with undeclared tool names, converted without allow-list guard. tools=%s",
+                        [item["name"] for item in parsed_calls],
+                    )
+            if not parsed_calls:
+                logger.warning(
+                    "Detected pseudo tool-call marker but failed to parse tool-call JSON arguments."
+                )
         if not parsed_calls:
             return None
         logger.warning(
@@ -1683,12 +1699,16 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             tool_choice_override=None,
         )
 
+        has_tool_context = effective_func_tool is not None
         tool_fallback_enabled = self._tool_fallback_enabled(effective_func_tool)
         tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
-        allow_parse = tool_fallback_mode in {"parse_then_retry", "parse_only"}
-        allow_retry = tool_fallback_mode in {"parse_then_retry", "retry_only"}
+        allow_parse = has_tool_context
+        allow_retry = tool_fallback_enabled and tool_fallback_mode in {
+            "parse_then_retry",
+            "retry_only",
+        }
 
-        if tool_fallback_enabled and allow_parse:
+        if allow_parse:
             converted = self._maybe_parse_pseudo_tool_calls(
                 llm_response,
                 effective_func_tool,
@@ -1698,12 +1718,11 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
         tool_fallback_remaining = (
             self._tool_fallback_retry_attempts()
-            if tool_fallback_enabled and allow_retry
+            if allow_retry
             else 0
         )
         while (
-            tool_fallback_enabled
-            and allow_retry
+            allow_retry
             and tool_fallback_remaining > 0
             and self._looks_like_pseudo_tool_call_text(llm_response)
             and not llm_response.tools_call_name
@@ -1765,12 +1784,16 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
         reasoning_effort = kwargs.get("reasoning_effort")
         response_format = kwargs.get("response_format")
+        has_tool_context = func_tool is not None
         tool_fallback_enabled = self._tool_fallback_enabled(func_tool)
         tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
-        allow_parse = tool_fallback_mode in {"parse_then_retry", "parse_only"}
-        allow_retry = tool_fallback_mode in {"parse_then_retry", "retry_only"}
+        allow_parse = has_tool_context
+        allow_retry = tool_fallback_enabled and tool_fallback_mode in {
+            "parse_then_retry",
+            "retry_only",
+        }
         stream_buffer_enabled = (
-            tool_fallback_enabled and self._tool_fallback_stream_buffer_enabled()
+            has_tool_context and self._tool_fallback_stream_buffer_enabled()
         )
 
         # Keep old immediate-yield behavior when stream buffering is disabled.
@@ -1798,7 +1821,6 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     ):
                         if (
                             not response.is_chunk
-                            and tool_fallback_enabled
                             and allow_parse
                         ):
                             converted = self._maybe_parse_pseudo_tool_calls(
