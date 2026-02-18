@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import random
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
@@ -603,6 +604,11 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     """OpenAI Responses API provider adapter for plugin distribution."""
 
     _ERROR_TEXT_CANDIDATE_MAX_CHARS = 4096
+    _TOOL_FALLBACK_MODES = {"parse_then_retry", "retry_only", "parse_only"}
+    _PSEUDO_TOOL_CALL_RE = re.compile(
+        r"assistant\s+to\s*=\s*functions\.([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    )
 
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         AstrProvider.__init__(self, provider_config, provider_settings)
@@ -686,6 +692,213 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 normalized,
             )
         return normalized
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    def _tool_fallback_enabled(self, tools: ToolSet | None) -> bool:
+        if tools is None:
+            return False
+        if not self._extract_allowed_tool_names(tools):
+            return False
+        raw = self.provider_config.get("tool_fallback_enabled", True)
+        return self._coerce_bool(raw, True)
+
+    def _tool_fallback_mode(self) -> str:
+        raw = self.provider_config.get("tool_fallback_mode", "parse_then_retry")
+        if not isinstance(raw, str):
+            return "parse_then_retry"
+        normalized = raw.strip().lower()
+        if normalized in self._TOOL_FALLBACK_MODES:
+            return normalized
+        logger.warning(
+            "Unknown tool_fallback_mode=%s, fallback to parse_then_retry.",
+            raw,
+        )
+        return "parse_then_retry"
+
+    def _tool_fallback_retry_attempts(self) -> int:
+        raw = self.provider_config.get("tool_fallback_retry_attempts", 1)
+        try:
+            attempts = int(raw)
+        except (TypeError, ValueError):
+            attempts = 1
+        return max(0, min(3, attempts))
+
+    def _tool_fallback_force_tool_choice(self) -> str | dict[str, Any]:
+        raw = self.provider_config.get("tool_fallback_force_tool_choice", "required")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized:
+                return normalized
+        return "required"
+
+    def _tool_fallback_stream_buffer_enabled(self) -> bool:
+        raw = self.provider_config.get("tool_fallback_stream_buffer", True)
+        return self._coerce_bool(raw, True)
+
+    @staticmethod
+    def _extract_allowed_tool_names(tools: ToolSet | None) -> set[str]:
+        if tools is None:
+            return set()
+        names: set[str] = set()
+        func_list = getattr(tools, "func_list", None)
+        if not isinstance(func_list, list):
+            return names
+        for tool in func_list:
+            name = getattr(tool, "name", None)
+            if isinstance(name, str) and name:
+                names.add(name)
+        return names
+
+    @staticmethod
+    def _extract_json_object_after_index(
+        text: str, start_idx: int
+    ) -> tuple[str | None, int]:
+        obj_start: int | None = None
+        depth = 0
+        in_string = False
+        escaping = False
+
+        for idx in range(start_idx, len(text)):
+            ch = text[idx]
+            if obj_start is None:
+                if ch == "{":
+                    obj_start = idx
+                    depth = 1
+                continue
+
+            if in_string:
+                if escaping:
+                    escaping = False
+                    continue
+                if ch == "\\":
+                    escaping = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    return text[obj_start : idx + 1], idx + 1
+
+        return None, start_idx
+
+    def _parse_pseudo_tool_calls(
+        self,
+        text: str,
+        *,
+        allowed_tool_names: set[str],
+    ) -> list[dict[str, Any]]:
+        parsed_calls: list[dict[str, Any]] = []
+        if not text or not allowed_tool_names:
+            return parsed_calls
+
+        for match in self._PSEUDO_TOOL_CALL_RE.finditer(text):
+            tool_name = match.group(1)
+            if tool_name not in allowed_tool_names:
+                continue
+            raw_json, _ = self._extract_json_object_after_index(text, match.end())
+            if not raw_json:
+                continue
+            try:
+                arguments_obj = json.loads(raw_json)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(arguments_obj, dict):
+                arguments_obj = {"_raw": raw_json}
+
+            parsed_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "name": tool_name,
+                    "arguments": arguments_obj,
+                    "raw_arguments": raw_json,
+                }
+            )
+        return parsed_calls
+
+    def _convert_pseudo_calls_to_llm_response(
+        self,
+        llm_response: LLMResponse,
+        parsed_calls: list[dict[str, Any]],
+    ) -> LLMResponse:
+        converted = LLMResponse(role="tool", completion_text="")
+        converted.id = llm_response.id
+        converted.usage = llm_response.usage
+        converted.reasoning_content = llm_response.reasoning_content
+        converted.reasoning_signature = llm_response.reasoning_signature
+        converted.tools_call_ids = [str(item["id"]) for item in parsed_calls]
+        converted.tools_call_name = [str(item["name"]) for item in parsed_calls]
+        converted.tools_call_args = [item["arguments"] for item in parsed_calls]
+
+        raw_completion: dict[str, Any]
+        if isinstance(llm_response.raw_completion, dict):
+            raw_completion = dict(llm_response.raw_completion)
+        else:
+            raw_completion = {"upstream_raw_completion": llm_response.raw_completion}
+        raw_completion["pseudo_tool_call_detected"] = True
+        raw_completion["pseudo_tool_calls"] = [
+            {
+                "id": str(item["id"]),
+                "name": str(item["name"]),
+                "raw_arguments": str(item["raw_arguments"]),
+            }
+            for item in parsed_calls
+        ]
+        converted.raw_completion = raw_completion
+        return converted
+
+    def _maybe_parse_pseudo_tool_calls(
+        self,
+        llm_response: LLMResponse,
+        tools: ToolSet | None,
+    ) -> LLMResponse | None:
+        if llm_response.tools_call_name:
+            return None
+        text = llm_response.completion_text
+        if not isinstance(text, str) or not text.strip():
+            return None
+        allowed_tool_names = self._extract_allowed_tool_names(tools)
+        parsed_calls = self._parse_pseudo_tool_calls(
+            text,
+            allowed_tool_names=allowed_tool_names,
+        )
+        if not parsed_calls:
+            return None
+        logger.warning(
+            "Detected pseudo tool-call text, converted to structured tool calls. tools=%s",
+            [item["name"] for item in parsed_calls],
+        )
+        return self._convert_pseudo_calls_to_llm_response(llm_response, parsed_calls)
+
+    def _looks_like_pseudo_tool_call_text(self, llm_response: LLMResponse) -> bool:
+        if llm_response.tools_call_name:
+            return False
+        text = llm_response.completion_text
+        if not isinstance(text, str) or not text.strip():
+            return False
+        return bool(self._PSEUDO_TOOL_CALL_RE.search(text))
 
     @staticmethod
     def _convert_message_content(
@@ -907,6 +1120,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         *,
         reasoning_effort: str | None = None,
         response_format: dict[str, Any] | None = None,
+        tool_choice_override: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         model = str(payloads.get("model") or self.get_model())
         messages = payloads.get("messages") or []
@@ -927,6 +1141,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             converted = self._convert_openai_tools_to_responses_tools(tool_list)
             if converted:
                 request_body["tools"] = converted
+                if tool_choice_override is not None:
+                    request_body["tool_choice"] = tool_choice_override
 
         effort_source = reasoning_effort
         if effort_source is None:
@@ -1083,12 +1299,14 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         api_key: str,
         reasoning_effort: str | None = None,
         response_format: dict[str, Any] | None = None,
+        tool_choice_override: str | dict[str, Any] | None = None,
     ) -> AsyncGenerator[LLMResponse, None]:
         request_body = self._build_responses_request(
             payloads,
             tools,
             reasoning_effort=reasoning_effort,
             response_format=response_format,
+            tool_choice_override=tool_choice_override,
         )
         processor = _ResponsesStreamProcessor(
             model=str(payloads.get("model") or self.get_model())
@@ -1371,6 +1589,65 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
         raise e
 
+    async def _query_final_response_with_retries(
+        self,
+        *,
+        payloads: dict[str, Any],
+        func_tool: ToolSet | None,
+        reasoning_effort: str | None,
+        response_format: dict[str, Any] | None,
+        tool_choice_override: str | dict[str, Any] | None,
+        max_retries: int = 10,
+    ) -> tuple[LLMResponse, ToolSet | None]:
+        available_api_keys = self.api_keys.copy()
+        chosen_key = random.choice(available_api_keys) if available_api_keys else ""
+        image_fallback_used = False
+        last_exception: Exception | None = None
+        retry_cnt = 0
+
+        for retry_cnt in range(max_retries):
+            try:
+                self.chosen_api_key = chosen_key
+                last_chunk: LLMResponse | None = None
+                async for resp in self._query_stream(
+                    payloads,
+                    func_tool,
+                    api_key=chosen_key,
+                    reasoning_effort=reasoning_effort,
+                    response_format=response_format,
+                    tool_choice_override=tool_choice_override,
+                ):
+                    last_chunk = resp
+                if last_chunk is None:
+                    raise Exception("Empty responses stream")
+                return last_chunk, func_tool
+            except Exception as e:
+                last_exception = e
+                (
+                    _,
+                    chosen_key,
+                    available_api_keys,
+                    payloads,
+                    _,
+                    func_tool,
+                    image_fallback_used,
+                ) = await self._handle_api_error(
+                    e,
+                    payloads,
+                    payloads.get("messages", []),
+                    func_tool,
+                    chosen_key,
+                    available_api_keys,
+                    retry_cnt,
+                    max_retries,
+                    image_fallback_used=image_fallback_used,
+                )
+
+        logger.error("Responses API call failed after %s retries.", max_retries)
+        if last_exception is None:
+            raise Exception("Unknown error")
+        raise last_exception
+
     async def text_chat(
         self,
         prompt=None,
@@ -1384,7 +1661,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         extra_user_content_parts=None,
         **kwargs,
     ) -> LLMResponse:
-        payloads, context_query = await self._prepare_chat_payload(
+        payloads, _ = await self._prepare_chat_payload(
             prompt,
             image_urls,
             contexts,
@@ -1395,57 +1672,65 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             **kwargs,
         )
 
-        llm_response: LLMResponse | None = None
-        max_retries = 10
-        available_api_keys = self.api_keys.copy()
-        chosen_key = random.choice(available_api_keys) if available_api_keys else ""
-        image_fallback_used = False
+        reasoning_effort = kwargs.get("reasoning_effort")
+        response_format = kwargs.get("response_format")
 
-        last_exception: Exception | None = None
-        retry_cnt = 0
-        for retry_cnt in range(max_retries):
-            try:
-                self.chosen_api_key = chosen_key
-                last_chunk: LLMResponse | None = None
-                async for resp in self._query_stream(
-                    payloads,
-                    func_tool,
-                    api_key=chosen_key,
-                    reasoning_effort=kwargs.get("reasoning_effort"),
-                    response_format=kwargs.get("response_format"),
-                ):
-                    last_chunk = resp
-                if last_chunk is None:
-                    raise Exception("Empty responses stream")
-                llm_response = last_chunk
-                break
-            except Exception as e:
-                last_exception = e
-                (
-                    _,
-                    chosen_key,
-                    available_api_keys,
-                    payloads,
-                    context_query,
-                    func_tool,
-                    image_fallback_used,
-                ) = await self._handle_api_error(
-                    e,
-                    payloads,
-                    context_query,
-                    func_tool,
-                    chosen_key,
-                    available_api_keys,
-                    retry_cnt,
-                    max_retries,
-                    image_fallback_used=image_fallback_used,
+        llm_response, effective_func_tool = await self._query_final_response_with_retries(
+            payloads=payloads,
+            func_tool=func_tool,
+            reasoning_effort=reasoning_effort,
+            response_format=response_format,
+            tool_choice_override=None,
+        )
+
+        tool_fallback_enabled = self._tool_fallback_enabled(effective_func_tool)
+        tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
+        allow_parse = tool_fallback_mode in {"parse_then_retry", "parse_only"}
+        allow_retry = tool_fallback_mode in {"parse_then_retry", "retry_only"}
+
+        if tool_fallback_enabled and allow_parse:
+            converted = self._maybe_parse_pseudo_tool_calls(
+                llm_response,
+                effective_func_tool,
+            )
+            if converted is not None:
+                llm_response = converted
+
+        tool_fallback_remaining = (
+            self._tool_fallback_retry_attempts()
+            if tool_fallback_enabled and allow_retry
+            else 0
+        )
+        while (
+            tool_fallback_enabled
+            and allow_retry
+            and tool_fallback_remaining > 0
+            and self._looks_like_pseudo_tool_call_text(llm_response)
+            and not llm_response.tools_call_name
+        ):
+            tool_fallback_remaining -= 1
+            force_tool_choice = self._tool_fallback_force_tool_choice()
+            logger.warning(
+                "Pseudo tool-call text detected, retrying Responses request with tool_choice=%s. remaining=%s",
+                force_tool_choice,
+                tool_fallback_remaining,
+            )
+            llm_response, effective_func_tool = await self._query_final_response_with_retries(
+                payloads=payloads,
+                func_tool=effective_func_tool,
+                reasoning_effort=reasoning_effort,
+                response_format=response_format,
+                tool_choice_override=force_tool_choice,
+            )
+            if allow_parse:
+                converted = self._maybe_parse_pseudo_tool_calls(
+                    llm_response,
+                    effective_func_tool,
                 )
-
-        if retry_cnt == max_retries - 1 or llm_response is None:
-            logger.error("Responses API call failed after %s retries.", max_retries)
-            if last_exception is None:
-                raise Exception("Unknown error")
-            raise last_exception
+                if converted is not None:
+                    llm_response = converted
+            if llm_response.tools_call_name:
+                break
 
         completion_text = llm_response.completion_text
         has_text = isinstance(completion_text, str) and bool(completion_text.strip())
@@ -1478,31 +1763,149 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             **kwargs,
         )
 
+        reasoning_effort = kwargs.get("reasoning_effort")
+        response_format = kwargs.get("response_format")
+        tool_fallback_enabled = self._tool_fallback_enabled(func_tool)
+        tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
+        allow_parse = tool_fallback_mode in {"parse_then_retry", "parse_only"}
+        allow_retry = tool_fallback_mode in {"parse_then_retry", "retry_only"}
+        stream_buffer_enabled = (
+            tool_fallback_enabled and self._tool_fallback_stream_buffer_enabled()
+        )
+
+        # Keep old immediate-yield behavior when stream buffering is disabled.
+        if not stream_buffer_enabled:
+            max_retries = 10
+            available_api_keys = self.api_keys.copy()
+            chosen_key = (
+                random.choice(available_api_keys) if available_api_keys else ""
+            )
+            image_fallback_used = False
+            last_exception: Exception | None = None
+            retry_cnt = 0
+
+            for retry_cnt in range(max_retries):
+                yielded_any = False
+                try:
+                    self.chosen_api_key = chosen_key
+                    async for response in self._query_stream(
+                        payloads,
+                        func_tool,
+                        api_key=chosen_key,
+                        reasoning_effort=reasoning_effort,
+                        response_format=response_format,
+                        tool_choice_override=None,
+                    ):
+                        if (
+                            not response.is_chunk
+                            and tool_fallback_enabled
+                            and allow_parse
+                        ):
+                            converted = self._maybe_parse_pseudo_tool_calls(
+                                response,
+                                func_tool,
+                            )
+                            if converted is not None:
+                                response = converted
+                        yielded_any = True
+                        yield response
+                    break
+                except Exception as e:
+                    last_exception = e
+                    if yielded_any:
+                        raise
+                    (
+                        _,
+                        chosen_key,
+                        available_api_keys,
+                        payloads,
+                        context_query,
+                        func_tool,
+                        image_fallback_used,
+                    ) = await self._handle_api_error(
+                        e,
+                        payloads,
+                        context_query,
+                        func_tool,
+                        chosen_key,
+                        available_api_keys,
+                        retry_cnt,
+                        max_retries,
+                        image_fallback_used=image_fallback_used,
+                    )
+
+            if retry_cnt == max_retries - 1:
+                logger.error(
+                    "Responses API streaming call failed after %s retries.",
+                    max_retries,
+                )
+                if last_exception is None:
+                    raise Exception("Unknown error")
+                raise last_exception
+            return
+
         max_retries = 10
         available_api_keys = self.api_keys.copy()
         chosen_key = random.choice(available_api_keys) if available_api_keys else ""
         image_fallback_used = False
 
+        tool_fallback_remaining = (
+            self._tool_fallback_retry_attempts() if allow_retry else 0
+        )
+        tool_choice_override: str | dict[str, Any] | None = None
         last_exception: Exception | None = None
         retry_cnt = 0
         for retry_cnt in range(max_retries):
-            yielded_any = False
+            buffered_responses: list[LLMResponse] = []
             try:
                 self.chosen_api_key = chosen_key
                 async for response in self._query_stream(
                     payloads,
                     func_tool,
                     api_key=chosen_key,
-                    reasoning_effort=kwargs.get("reasoning_effort"),
-                    response_format=kwargs.get("response_format"),
+                    reasoning_effort=reasoning_effort,
+                    response_format=response_format,
+                    tool_choice_override=tool_choice_override,
                 ):
-                    yielded_any = True
+                    buffered_responses.append(response)
+
+                if not buffered_responses:
+                    raise Exception("Empty responses stream")
+
+                final_response = buffered_responses[-1]
+                if allow_parse:
+                    converted = self._maybe_parse_pseudo_tool_calls(
+                        final_response,
+                        func_tool,
+                    )
+                    if converted is not None:
+                        final_response = converted
+                        # Drop buffered text chunks to avoid leaking pseudo-call text.
+                        buffered_responses = [final_response]
+
+                if (
+                    allow_retry
+                    and tool_fallback_remaining > 0
+                    and self._looks_like_pseudo_tool_call_text(final_response)
+                    and not final_response.tools_call_name
+                ):
+                    tool_fallback_remaining -= 1
+                    tool_choice_override = self._tool_fallback_force_tool_choice()
+                    logger.warning(
+                        "Pseudo tool-call text detected in stream, retrying with tool_choice=%s. remaining=%s",
+                        tool_choice_override,
+                        tool_fallback_remaining,
+                    )
+                    continue
+
+                if buffered_responses and buffered_responses[-1] is not final_response:
+                    buffered_responses[-1] = final_response
+
+                for response in buffered_responses:
                     yield response
-                break
+                return
             except Exception as e:
                 last_exception = e
-                if yielded_any:
-                    raise
                 (
                     _,
                     chosen_key,

@@ -52,6 +52,11 @@ def _register_provider() -> None:
         "custom_headers": {},
         "reasoning_effort": "",
         "custom_extra_body": {},
+        "tool_fallback_enabled": True,
+        "tool_fallback_mode": "parse_then_retry",
+        "tool_fallback_retry_attempts": 1,
+        "tool_fallback_force_tool_choice": "required",
+        "tool_fallback_stream_buffer": True,
     }
 
     register_or_replace_provider_adapter(

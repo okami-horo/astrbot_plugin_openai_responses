@@ -3,6 +3,7 @@ import json
 import pytest
 
 from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.provider.entities import LLMResponse
 
 try:
     # When running tests from the plugin repository root
@@ -484,3 +485,146 @@ async def test_query_stream_falls_back_to_text_from_response_completed(monkeypat
     assert final.role == "assistant"
     assert final.completion_text == "final text"
     assert final.tools_call_args == []
+
+
+def test_build_responses_request_sets_tool_choice_override_when_tools_present():
+    provider = _make_provider()
+    tools = _make_tool_set()
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(
+        payloads,
+        tools,
+        tool_choice_override="required",
+    )
+
+    assert request["stream"] is True
+    assert request["tool_choice"] == "required"
+
+
+@pytest.mark.asyncio
+async def test_text_chat_converts_pseudo_tool_call_without_retry(monkeypatch):
+    provider = _make_provider()
+    tools = _make_tool_set()
+    call_count = 0
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        nonlocal call_count
+        call_count += 1
+        assert tool_set is tools
+        assert api_key == "test-key"
+        assert tool_choice_override is None
+        yield LLMResponse(
+            role="assistant",
+            completion_text='assistant to=functions.test_tool\n{"q":"x"}',
+        )
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    resp = await provider.text_chat(prompt="hello", func_tool=tools)
+
+    assert call_count == 1
+    assert resp.role == "tool"
+    assert resp.tools_call_name == ["test_tool"]
+    assert resp.tools_call_args == [{"q": "x"}]
+    assert resp.completion_text == ""
+
+
+@pytest.mark.asyncio
+async def test_text_chat_retries_with_required_tool_choice_after_pseudo_parse_fail(
+    monkeypatch,
+):
+    provider = _make_provider()
+    tools = _make_tool_set()
+    seen_tool_choice: list[str | dict | None] = []
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        assert tool_set is tools
+        assert api_key == "test-key"
+        seen_tool_choice.append(tool_choice_override)
+        if len(seen_tool_choice) == 1:
+            yield LLMResponse(
+                role="assistant",
+                completion_text="assistant to=functions.test_tool\n{not-json}",
+            )
+            return
+        resp = LLMResponse(role="tool")
+        resp.tools_call_ids = ["call_1"]
+        resp.tools_call_name = ["test_tool"]
+        resp.tools_call_args = [{"q": "x"}]
+        yield resp
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    resp = await provider.text_chat(prompt="hello", func_tool=tools)
+
+    assert seen_tool_choice == [None, "required"]
+    assert resp.role == "tool"
+    assert resp.tools_call_name == ["test_tool"]
+    assert resp.tools_call_args == [{"q": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_text_chat_stream_buffers_first_attempt_and_retries_on_pseudo_tool_call(
+    monkeypatch,
+):
+    provider = _make_provider()
+    tools = _make_tool_set()
+    seen_tool_choice: list[str | dict | None] = []
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        assert tool_set is tools
+        assert api_key == "test-key"
+        seen_tool_choice.append(tool_choice_override)
+        if len(seen_tool_choice) == 1:
+            yield LLMResponse(
+                role="assistant",
+                completion_text="assistant to=functions.test_tool",
+                is_chunk=True,
+            )
+            yield LLMResponse(
+                role="assistant",
+                completion_text="assistant to=functions.test_tool\n{not-json}",
+            )
+            return
+        resp = LLMResponse(role="tool")
+        resp.tools_call_ids = ["call_1"]
+        resp.tools_call_name = ["test_tool"]
+        resp.tools_call_args = [{"q": "x"}]
+        yield resp
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    outputs = []
+    async for response in provider.text_chat_stream(prompt="hello", func_tool=tools):
+        outputs.append(response)
+
+    assert seen_tool_choice == [None, "required"]
+    assert len(outputs) == 1
+    assert outputs[0].role == "tool"
+    assert outputs[0].tools_call_name == ["test_tool"]
+    assert outputs[0].tools_call_args == [{"q": "x"}]

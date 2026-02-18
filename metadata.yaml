@@ -1,6 +1,6 @@
 name: astrbot_plugin_openai_responses
 display_name: OpenAI Responses API Provider
 desc: OpenAI Responses API Provider
-version: 0.1.2
+version: 0.1.3
 author: okami-horo
 repo: https://github.com/okami-horo/astrbot_plugin_openai_responses
