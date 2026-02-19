@@ -239,6 +239,45 @@ async def test_query_stream_parses_text_reasoning_tool_calls_and_usage(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_query_stream_keeps_mixed_output_text_and_content_part_delta_in_order(
+    monkeypatch,
+):
+    provider = _make_provider()
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "Hello"},
+        )
+        yield (
+            "response.content_part.delta",
+            {
+                "type": "response.content_part.delta",
+                "delta": {"text": " world"},
+            },
+        )
+        yield ("response.completed", {"type": "response.completed", "response": {}})
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    chunks = [o.completion_text for o in outputs if o.is_chunk]
+    assert chunks == ["Hello", " world"]
+    assert outputs[-1].completion_text == "Hello world"
+
+
+@pytest.mark.asyncio
 async def test_text_chat_returns_refusal_text_when_refusal_events_exist(monkeypatch):
     provider = _make_provider()
 
@@ -390,6 +429,175 @@ async def test_query_stream_keeps_interleaved_tool_calls_without_loss(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_query_stream_ingests_tool_calls_from_response_output_without_deltas(
+    monkeypatch,
+):
+    provider = _make_provider()
+    tools = _make_tool_set()
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "test_tool",
+                            "arguments": '{"q":"x"}',
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, tools, api_key="test-key"):
+        outputs.append(resp)
+
+    final = outputs[-1]
+    assert final.role == "tool"
+    assert final.tools_call_ids == ["call_1"]
+    assert final.tools_call_name == ["test_tool"]
+    assert final.tools_call_args == [{"q": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_query_stream_keeps_interleaved_tool_calls_with_output_item_done(
+    monkeypatch,
+):
+    provider = _make_provider()
+    tools = ToolSet(
+        [
+            FunctionTool(
+                name="tool_a",
+                description="tool a",
+                parameters={"type": "object", "properties": {"a": {"type": "integer"}}},
+                handler=None,
+            ),
+            FunctionTool(
+                name="tool_b",
+                description="tool b",
+                parameters={"type": "object", "properties": {"b": {"type": "integer"}}},
+                handler=None,
+            ),
+        ]
+    )
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "tool_a",
+                },
+            },
+        )
+        yield (
+            "response.function_call_arguments.delta",
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": '{"a":',
+            },
+        )
+        yield (
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_2",
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "tool_b",
+                },
+            },
+        )
+        yield (
+            "response.function_call_arguments.delta",
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_2",
+                "delta": '{"b":2}',
+            },
+        )
+        yield (
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_2",
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "tool_b",
+                    "arguments": '{"b":2}',
+                },
+            },
+        )
+        yield (
+            "response.function_call_arguments.delta",
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "1}",
+            },
+        )
+        yield (
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "tool_a",
+                    "arguments": '{"a":1}',
+                },
+            },
+        )
+        yield ("response.completed", {"type": "response.completed", "response": {}})
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    outputs = []
+    async for resp in provider._query_stream(payloads, tools, api_key="test-key"):
+        outputs.append(resp)
+
+    final = outputs[-1]
+    assert final.role == "tool"
+    assert final.tools_call_ids == ["call_1", "call_2"]
+    assert final.tools_call_name == ["tool_a", "tool_b"]
+    assert final.tools_call_args == [{"a": 1}, {"b": 2}]
+
+
+@pytest.mark.asyncio
 async def test_iter_responses_sse_supports_multiline_data_event(monkeypatch):
     provider = _make_provider()
 
@@ -487,6 +695,78 @@ async def test_query_stream_falls_back_to_text_from_response_completed(monkeypat
     assert final.tools_call_args == []
 
 
+@pytest.mark.asyncio
+async def test_query_stream_falls_back_to_text_from_response_completed_without_usage(
+    monkeypatch,
+):
+    provider = _make_provider()
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "final text"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert outputs[-1].role == "assistant"
+    assert outputs[-1].completion_text == "final text"
+
+
+@pytest.mark.asyncio
+async def test_query_stream_aligns_completion_when_output_text_done_is_emitted(
+    monkeypatch,
+):
+    provider = _make_provider()
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert request_body["stream"] is True
+        assert api_key == "test-key"
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "Hello"},
+        )
+        yield (
+            "response.output_text.done",
+            {"type": "response.output_text.done", "text": "Hello world"},
+        )
+        yield ("response.completed", {"type": "response.completed", "response": {}})
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert outputs[-1].completion_text == "Hello world"
+
+
 def test_build_responses_request_sets_tool_choice_override_when_tools_present():
     provider = _make_provider()
     tools = _make_tool_set()
@@ -500,6 +780,174 @@ def test_build_responses_request_sets_tool_choice_override_when_tools_present():
 
     assert request["stream"] is True
     assert request["tool_choice"] == "required"
+
+
+def test_build_responses_request_is_stateless_and_does_not_set_previous_response_id():
+    provider = _make_provider()
+    payloads = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+    request = provider._build_responses_request(payloads, None)
+
+    assert "previous_response_id" not in request
+
+
+@pytest.mark.asyncio
+async def test_query_final_response_rotates_key_on_401_and_retries(monkeypatch):
+    provider = _make_provider(overrides={"key": ["k1", "k2"]})
+
+    import asyncio
+    import random
+    import sys
+
+    try:
+        from responses_errors import UpstreamResponsesError
+    except ImportError:  # pragma: no cover
+        from data.plugins.astrbot_plugin_openai_responses.responses_errors import (
+            UpstreamResponsesError,
+        )
+
+    monkeypatch.setattr(random, "choice", lambda seq: seq[0])
+
+    calls: list[str] = []
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        calls.append(api_key)
+        if len(calls) == 1:
+            raise UpstreamResponsesError("unauthorized", status_code=401, body={})
+        yield LLMResponse(role="assistant", completion_text="ok")
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    resp, _ = await provider._query_final_response_with_retries(
+        payloads={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        func_tool=None,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+        max_retries=3,
+    )
+
+    assert resp.completion_text == "ok"
+    assert calls == ["k1", "k2"]
+
+
+@pytest.mark.asyncio
+async def test_query_final_response_applies_backoff_on_429(monkeypatch):
+    provider = _make_provider(overrides={"key": ["k1", "k2"]})
+
+    import asyncio
+    import random
+
+    try:
+        from responses_errors import UpstreamResponsesError
+    except ImportError:  # pragma: no cover
+        from data.plugins.astrbot_plugin_openai_responses.responses_errors import (
+            UpstreamResponsesError,
+        )
+
+    monkeypatch.setattr(random, "choice", lambda seq: seq[0])
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float):
+        sleep_calls.append(float(seconds))
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    calls: list[str] = []
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        calls.append(api_key)
+        if len(calls) == 1:
+            raise UpstreamResponsesError("rate limited", status_code=429, body={})
+        yield LLMResponse(role="assistant", completion_text="ok")
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    resp, _ = await provider._query_final_response_with_retries(
+        payloads={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        func_tool=None,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+        max_retries=3,
+    )
+
+    assert resp.completion_text == "ok"
+    assert calls == ["k1", "k2"]
+    assert sleep_calls and sleep_calls[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_query_final_response_retries_on_connection_error_with_backoff(
+    monkeypatch,
+):
+    provider = _make_provider(overrides={"key": ["k1"]})
+
+    import asyncio
+    import random
+    import sys
+
+    monkeypatch.setattr(random, "choice", lambda seq: seq[0])
+
+    module = sys.modules[provider.__class__.__module__]
+    monkeypatch.setattr(module, "is_connection_error", lambda _exc: True)
+    monkeypatch.setattr(module, "log_connection_failure", lambda *_a, **_k: None)
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float):
+        sleep_calls.append(float(seconds))
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    calls = 0
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise Exception("connection dropped")
+        yield LLMResponse(role="assistant", completion_text="ok")
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    resp, _ = await provider._query_final_response_with_retries(
+        payloads={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        func_tool=None,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+        max_retries=3,
+    )
+
+    assert resp.completion_text == "ok"
+    assert calls == 2
+    assert sleep_calls and sleep_calls[0] > 0
 
 
 @pytest.mark.asyncio

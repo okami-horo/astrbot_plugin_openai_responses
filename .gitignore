@@ -34,6 +34,14 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Temp files
+*.tmp
+*.swp
+
 # Local secrets
 .env
 .env.*
+
+specs/
+.codex/
+.specify/

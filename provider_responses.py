@@ -4,21 +4,18 @@ import asyncio
 import base64
 import json
 import random
-import re
+import time
 import uuid
 from collections.abc import AsyncGenerator
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
 
-import astrbot.core.message.components as Comp
 from astrbot import logger
 from astrbot.api.provider import Provider as AstrProvider
 from astrbot.core.agent.message import ContentPart, ImageURLPart, TextPart
 from astrbot.core.agent.tool import ToolSet
-from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.provider.entities import LLMResponse, TokenUsage, ToolCallsResult
+from astrbot.core.provider.entities import LLMResponse, ToolCallsResult
 from astrbot.core.utils.io import download_image_by_url
 from astrbot.core.utils.network_utils import (
     create_proxy_client,
@@ -26,578 +23,43 @@ from astrbot.core.utils.network_utils import (
     log_connection_failure,
 )
 
+try:
+    from responses_config import normalize_provider_config
+except ImportError:  # pragma: no cover
+    from .responses_config import normalize_provider_config
 
-class _UpstreamResponsesError(Exception):
-    """A lightweight error wrapper with fields used by existing handlers."""
+try:
+    from responses_redaction import redact_proxy_url
+except ImportError:  # pragma: no cover
+    from .responses_redaction import redact_proxy_url
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        body: dict[str, Any] | str | None = None,
-        response_text: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.body = body
-        if response_text is None:
-            if isinstance(body, dict):
-                response_text = json.dumps(body, ensure_ascii=False, default=str)
-            else:
-                response_text = "" if body is None else str(body)
-        self.response = SimpleNamespace(text=response_text)
+try:
+    from responses_errors import UpstreamResponsesError, compute_backoff_seconds, error_type
+except ImportError:  # pragma: no cover
+    from .responses_errors import UpstreamResponsesError, compute_backoff_seconds, error_type
 
+try:
+    from responses_sse import iter_responses_sse_events
+except ImportError:  # pragma: no cover
+    from .responses_sse import iter_responses_sse_events
 
-class _ResponsesStreamProcessor:
-    """Accumulates OpenAI Responses SSE events into AstrBot LLMResponse objects."""
+try:
+    from responses_accumulator import ResponsesStreamAccumulator
+except ImportError:  # pragma: no cover
+    from .responses_accumulator import ResponsesStreamAccumulator
 
-    def __init__(self, model: str) -> None:
-        self.model = model
-        self.response_id: str | None = None
-        self.accumulated_text = ""
-        self.accumulated_refusal = ""
-        self.accumulated_reasoning = ""
-        self.usage: dict[str, Any] | None = None
-
-        self.tool_calls_by_id: dict[str, dict[str, Any]] = {}
-        self.tool_call_order: list[str] = []
-        self.active_tool_call_ids: list[str] = []
-        self.tool_call_item_map: dict[str, str] = {}
-        self.tool_call_output_index_map: dict[int, str] = {}
-
-    @staticmethod
-    def _convert_usage_to_token_usage(
-        usage: dict[str, Any] | None,
-    ) -> TokenUsage | None:
-        if not usage:
-            return None
-        input_tokens = int(usage.get("input_tokens") or 0)
-        output_tokens = int(usage.get("output_tokens") or 0)
-        cached_tokens = 0
-        details = usage.get("input_tokens_details")
-        if isinstance(details, dict):
-            cached_tokens = int(details.get("cached_tokens") or 0)
-        return TokenUsage(
-            input_other=max(input_tokens - cached_tokens, 0),
-            input_cached=max(cached_tokens, 0),
-            output=max(output_tokens, 0),
-        )
-
-    @staticmethod
-    def _normalize_output_index(value: Any) -> int | None:
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-        return None
-
-    def _append_text_chunk(
-        self,
-        chunks: list[LLMResponse],
-        text: str,
-        *,
-        stream_chunk: bool = True,
-    ) -> None:
-        if not text:
-            return
-        self.accumulated_text += text
-        if stream_chunk:
-            chunks.append(
-                LLMResponse(
-                    role="assistant",
-                    result_chain=MessageChain(chain=[Comp.Plain(text)]),
-                    is_chunk=True,
-                    id=self.response_id,
-                )
-            )
-
-    @staticmethod
-    def _extract_text_from_content(content: Any) -> str:
-        if not isinstance(content, list):
-            return ""
-        text_parts: list[str] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = str(part.get("type") or "")
-            if part_type == "refusal":
-                continue
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                text_parts.append(text)
-        return "".join(text_parts)
-
-    @classmethod
-    def _extract_text_from_item(cls, item: dict[str, Any]) -> str:
-        text_parts: list[str] = []
-        item_type = str(item.get("type") or "")
-        if item_type in {"output_text", "text"}:
-            text = item.get("text")
-            if isinstance(text, str) and text:
-                text_parts.append(text)
-        content = item.get("content")
-        content_text = cls._extract_text_from_content(content)
-        if content_text:
-            text_parts.append(content_text)
-        return "".join(text_parts)
-
-    @classmethod
-    def _extract_text_from_response(cls, response_obj: dict[str, Any]) -> str:
-        text_parts: list[str] = []
-        output = response_obj.get("output")
-        if isinstance(output, list):
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-                text = cls._extract_text_from_item(item)
-                if text:
-                    text_parts.append(text)
-        output_text = response_obj.get("output_text")
-        if isinstance(output_text, str) and output_text:
-            text_parts.append(output_text)
-        return "".join(text_parts)
-
-    def _append_refusal_text(
-        self,
-        chunks: list[LLMResponse],
-        text: str,
-        *,
-        stream_chunk: bool = True,
-    ) -> None:
-        if not text:
-            return
-        self.accumulated_refusal += text
-        if stream_chunk:
-            chunks.append(
-                LLMResponse(
-                    role="assistant",
-                    result_chain=MessageChain(chain=[Comp.Plain(text)]),
-                    is_chunk=True,
-                    id=self.response_id,
-                )
-            )
-
-    def _ensure_tool_call(self, call_id: str) -> dict[str, Any]:
-        tool_call = self.tool_calls_by_id.get(call_id)
-        if tool_call is None:
-            tool_call = {
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": "",
-                    "arguments": "",
-                },
-            }
-            self.tool_calls_by_id[call_id] = tool_call
-            self.tool_call_order.append(call_id)
-        return tool_call
-
-    def _mark_tool_call_active(self, call_id: str) -> None:
-        if call_id in self.active_tool_call_ids:
-            self.active_tool_call_ids.remove(call_id)
-        self.active_tool_call_ids.append(call_id)
-
-    def _mark_tool_call_done(self, call_id: str) -> None:
-        if call_id in self.active_tool_call_ids:
-            self.active_tool_call_ids.remove(call_id)
-
-    def _register_tool_call(
-        self,
-        *,
-        call_id: str,
-        name: str,
-        item_id: str | None = None,
-        output_index: int | None = None,
-        arguments: str | None = None,
-    ) -> None:
-        tool_call = self._ensure_tool_call(call_id)
-        if name:
-            tool_call["function"]["name"] = name
-        if arguments:
-            tool_call["function"]["arguments"] = arguments
-        if item_id:
-            self.tool_call_item_map[item_id] = call_id
-        if output_index is not None:
-            self.tool_call_output_index_map[output_index] = call_id
-        self._mark_tool_call_active(call_id)
-
-    def _append_tool_call_arguments(self, call_id: str, delta_args: str) -> None:
-        if not delta_args:
-            return
-        tool_call = self._ensure_tool_call(call_id)
-        curr_args = tool_call["function"].get("arguments", "")
-        tool_call["function"]["arguments"] = f"{curr_args}{delta_args}"
-        self._mark_tool_call_active(call_id)
-
-    def _resolve_tool_call_id(self, event_data: dict[str, Any]) -> str | None:
-        call_id = event_data.get("call_id")
-        if isinstance(call_id, str) and call_id:
-            return call_id
-
-        item_id = event_data.get("item_id")
-        if isinstance(item_id, str) and item_id:
-            mapped_call_id = self.tool_call_item_map.get(item_id)
-            if mapped_call_id:
-                return mapped_call_id
-
-        output_index = self._normalize_output_index(event_data.get("output_index"))
-        if output_index is not None:
-            mapped_call_id = self.tool_call_output_index_map.get(output_index)
-            if mapped_call_id:
-                return mapped_call_id
-
-        candidate_id = event_data.get("id")
-        if isinstance(candidate_id, str) and candidate_id in self.tool_calls_by_id:
-            return candidate_id
-
-        if self.active_tool_call_ids:
-            return self.active_tool_call_ids[-1]
-        if self.tool_call_order:
-            return self.tool_call_order[-1]
-        return None
-
-    def _finalize_tool_call(
-        self,
-        *,
-        call_id: str,
-        arguments: str | None = None,
-    ) -> None:
-        tool_call = self._ensure_tool_call(call_id)
-        if isinstance(arguments, str) and arguments:
-            tool_call["function"]["arguments"] = arguments
-        self._mark_tool_call_done(call_id)
-
-    @staticmethod
-    def _extract_refusal_text_from_content(content: Any) -> str:
-        if not isinstance(content, list):
-            return ""
-        refusal_text_parts: list[str] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = str(part.get("type") or "")
-            if part_type != "refusal" and "refusal" not in part:
-                continue
-            refusal = part.get("refusal")
-            if isinstance(refusal, str) and refusal:
-                refusal_text_parts.append(refusal)
-                continue
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                refusal_text_parts.append(text)
-        return "".join(refusal_text_parts)
-
-    @classmethod
-    def _extract_refusal_text_from_item(cls, item: dict[str, Any]) -> str:
-        refusal_text_parts: list[str] = []
-        item_type = str(item.get("type") or "")
-        if item_type == "refusal" or "refusal" in item:
-            refusal = item.get("refusal")
-            if isinstance(refusal, str) and refusal:
-                refusal_text_parts.append(refusal)
-            else:
-                text = item.get("text")
-                if isinstance(text, str) and text:
-                    refusal_text_parts.append(text)
-
-        content = item.get("content")
-        refusal_from_content = cls._extract_refusal_text_from_content(content)
-        if refusal_from_content:
-            refusal_text_parts.append(refusal_from_content)
-
-        return "".join(refusal_text_parts)
-
-    @classmethod
-    def _extract_refusal_text_from_response(cls, response_obj: dict[str, Any]) -> str:
-        refusal_text_parts: list[str] = []
-        output = response_obj.get("output")
-        if isinstance(output, list):
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-                refusal_text = cls._extract_refusal_text_from_item(item)
-                if refusal_text:
-                    refusal_text_parts.append(refusal_text)
-        return "".join(refusal_text_parts)
-
-    def _ingest_tool_calls_from_response(self, response_obj: dict[str, Any]) -> None:
-        output = response_obj.get("output")
-        if not isinstance(output, list):
-            return
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "function_call":
-                continue
-
-            item_id = item.get("id")
-            call_id = item.get("call_id")
-            if not isinstance(call_id, str) or not call_id:
-                if isinstance(item_id, str) and item_id:
-                    call_id = item_id
-                else:
-                    call_id = f"call_{uuid.uuid4().hex[:24]}"
-
-            name = item.get("name")
-            if not isinstance(name, str):
-                name = ""
-
-            output_index = self._normalize_output_index(item.get("output_index"))
-            arguments = item.get("arguments")
-            if not isinstance(arguments, str):
-                arguments = None
-
-            self._register_tool_call(
-                call_id=call_id,
-                name=name,
-                item_id=item_id if isinstance(item_id, str) else None,
-                output_index=output_index,
-                arguments=arguments,
-            )
-            self._mark_tool_call_done(call_id)
-
-    def handle_event(
-        self,
-        event_type: str,
-        event_data: dict[str, Any],
-    ) -> list[LLMResponse]:
-        chunks: list[LLMResponse] = []
-
-        if event_type == "response.created":
-            response_obj = event_data.get("response")
-            if isinstance(response_obj, dict):
-                rid = response_obj.get("id")
-                if isinstance(rid, str) and rid:
-                    self.response_id = rid
-            return chunks
-
-        if event_type == "response.output_text.delta":
-            delta_text = event_data.get("delta")
-            if isinstance(delta_text, str) and delta_text:
-                self._append_text_chunk(chunks, delta_text)
-            return chunks
-
-        if event_type == "response.content_part.delta":
-            delta = event_data.get("delta")
-            if isinstance(delta, dict):
-                text = delta.get("text")
-                if isinstance(text, str) and text:
-                    self._append_text_chunk(chunks, text)
-                refusal = delta.get("refusal")
-                if isinstance(refusal, str) and refusal:
-                    self._append_refusal_text(chunks, refusal)
-            return chunks
-
-        if event_type in {"response.refusal.delta", "response.output_refusal.delta"}:
-            delta_text = event_data.get("delta")
-            if isinstance(delta_text, str) and delta_text:
-                self._append_refusal_text(chunks, delta_text)
-            return chunks
-
-        if event_type in {"response.refusal.done", "response.output_refusal.done"}:
-            if not self.accumulated_refusal:
-                refusal = event_data.get("refusal")
-                if isinstance(refusal, str) and refusal:
-                    self._append_refusal_text(chunks, refusal, stream_chunk=False)
-            return chunks
-
-        if event_type in {
-            "response.reasoning_summary_text.delta",
-            "response.reasoning_text.delta",
-            "response.reasoning.delta",
-        }:
-            delta_text = event_data.get("delta")
-            if isinstance(delta_text, str) and delta_text:
-                self.accumulated_reasoning += delta_text
-                chunks.append(
-                    LLMResponse(
-                        role="assistant",
-                        reasoning_content=delta_text,
-                        is_chunk=True,
-                        id=self.response_id,
-                    )
-                )
-            return chunks
-
-        if event_type == "response.output_item.added":
-            item = event_data.get("item")
-            if isinstance(item, dict) and item.get("type") == "function_call":
-                item_id = item.get("id")
-                call_id = item.get("call_id")
-                if not isinstance(call_id, str) or not call_id:
-                    if isinstance(item_id, str) and item_id:
-                        call_id = item_id
-                    else:
-                        call_id = f"call_{uuid.uuid4().hex[:24]}"
-                name = item.get("name")
-                if not isinstance(name, str):
-                    name = ""
-                output_index = self._normalize_output_index(item.get("output_index"))
-                if output_index is None:
-                    output_index = self._normalize_output_index(
-                        event_data.get("output_index")
-                    )
-                arguments = item.get("arguments")
-                if not isinstance(arguments, str):
-                    arguments = None
-                self._register_tool_call(
-                    call_id=call_id,
-                    name=name,
-                    item_id=item_id if isinstance(item_id, str) else None,
-                    output_index=output_index,
-                    arguments=arguments,
-                )
-            return chunks
-
-        if event_type == "response.output_item.done":
-            item = event_data.get("item")
-            if isinstance(item, dict) and item.get("type") == "function_call":
-                call_id = item.get("call_id")
-                if not isinstance(call_id, str) or not call_id:
-                    item_id = item.get("id")
-                    if isinstance(item_id, str) and item_id:
-                        call_id = self.tool_call_item_map.get(item_id, item_id)
-                    else:
-                        call_id = self._resolve_tool_call_id(event_data)
-                if isinstance(call_id, str) and call_id:
-                    arguments = item.get("arguments")
-                    if not isinstance(arguments, str):
-                        arguments = None
-                    self._finalize_tool_call(call_id=call_id, arguments=arguments)
-            return chunks
-
-        if event_type == "response.function_call_arguments.delta":
-            call_id = self._resolve_tool_call_id(event_data)
-            if call_id is None:
-                logger.warning(
-                    "Received function_call_arguments.delta but no tool call can be resolved. event=%s",
-                    event_data,
-                )
-                return chunks
-            delta_args = event_data.get("delta")
-            if isinstance(delta_args, str) and delta_args:
-                self._append_tool_call_arguments(call_id, delta_args)
-            return chunks
-
-        if event_type == "response.function_call_arguments.done":
-            call_id = self._resolve_tool_call_id(event_data)
-            if call_id is None:
-                logger.warning(
-                    "Received function_call_arguments.done but no tool call can be resolved. event=%s",
-                    event_data,
-                )
-                return chunks
-            arguments = event_data.get("arguments")
-            if not isinstance(arguments, str):
-                arguments = None
-            self._finalize_tool_call(call_id=call_id, arguments=arguments)
-            return chunks
-
-        if event_type in {"response.completed", "response.done"}:
-            response_obj = event_data.get("response")
-            if isinstance(response_obj, dict) and isinstance(
-                response_obj.get("usage"), dict
-            ):
-                self.usage = response_obj["usage"]
-                self._ingest_tool_calls_from_response(response_obj)
-                final_text = self._extract_text_from_response(response_obj)
-                if final_text:
-                    if not self.accumulated_text:
-                        self._append_text_chunk(
-                            chunks,
-                            final_text,
-                            stream_chunk=False,
-                        )
-                    elif final_text != self.accumulated_text:
-                        if final_text.startswith(self.accumulated_text):
-                            missing = final_text[len(self.accumulated_text) :]
-                            if missing:
-                                self._append_text_chunk(
-                                    chunks,
-                                    missing,
-                                    stream_chunk=False,
-                                )
-                        elif len(final_text) > len(self.accumulated_text):
-                            self.accumulated_text = final_text
-                if not self.accumulated_refusal:
-                    refusal_text = self._extract_refusal_text_from_response(
-                        response_obj
-                    )
-                    if refusal_text:
-                        self._append_refusal_text(
-                            chunks,
-                            refusal_text,
-                            stream_chunk=False,
-                        )
-            elif isinstance(event_data.get("usage"), dict):
-                self.usage = event_data["usage"]
-            return chunks
-
-        return chunks
-
-    def build_final_response(self, *, tools_provided: bool) -> LLMResponse:
-        llm_response = LLMResponse(role="assistant")
-        llm_response.id = self.response_id
-
-        if self.accumulated_text:
-            llm_response.result_chain = MessageChain().message(self.accumulated_text)
-        elif self.accumulated_refusal:
-            llm_response.result_chain = MessageChain().message(self.accumulated_refusal)
-
-        if self.accumulated_reasoning:
-            llm_response.reasoning_content = self.accumulated_reasoning
-
-        ordered_tool_calls = [
-            self.tool_calls_by_id[call_id]
-            for call_id in self.tool_call_order
-            if call_id in self.tool_calls_by_id
-        ]
-
-        if ordered_tool_calls:
-            if not tools_provided:
-                raise Exception("工具集未提供")
-            tool_args: list[dict[str, Any]] = []
-            tool_names: list[str] = []
-            tool_ids: list[str] = []
-            for tool_call in ordered_tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                call_id = str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
-                func = tool_call.get("function")
-                if not isinstance(func, dict):
-                    continue
-                name = str(func.get("name") or "")
-                raw_arguments = func.get("arguments", "{}")
-                if isinstance(raw_arguments, str):
-                    try:
-                        args_obj = json.loads(raw_arguments)
-                        if not isinstance(args_obj, dict):
-                            args_obj = {"_raw": raw_arguments}
-                    except json.JSONDecodeError:
-                        args_obj = {"_raw": raw_arguments}
-                elif isinstance(raw_arguments, dict):
-                    args_obj = raw_arguments
-                else:
-                    args_obj = {"_raw": str(raw_arguments)}
-
-                tool_ids.append(call_id)
-                tool_names.append(name)
-                tool_args.append(args_obj)
-
-            llm_response.role = "tool"
-            llm_response.tools_call_ids = tool_ids
-            llm_response.tools_call_name = tool_names
-            llm_response.tools_call_args = tool_args
-
-        llm_response.usage = self._convert_usage_to_token_usage(self.usage)
-        llm_response.raw_completion = {
-            "id": self.response_id,
-            "usage": self.usage,
-            "tool_calls": ordered_tool_calls,
-            "refusal": self.accumulated_refusal,
-        }
-        return llm_response
+try:
+    from responses_tools import (
+        extract_allowed_tool_names,
+        looks_like_pseudo_tool_call_text,
+        maybe_convert_pseudo_tool_calls,
+    )
+except ImportError:  # pragma: no cover
+    from .responses_tools import (
+        extract_allowed_tool_names,
+        looks_like_pseudo_tool_call_text,
+        maybe_convert_pseudo_tool_calls,
+    )
 
 
 class ProviderOpenAIResponsesPlugin(AstrProvider):
@@ -605,32 +67,27 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
     _ERROR_TEXT_CANDIDATE_MAX_CHARS = 4096
     _TOOL_FALLBACK_MODES = {"parse_then_retry", "retry_only", "parse_only"}
-    _PSEUDO_TOOL_CALL_RE = re.compile(
-        r"assistant\s+to\s*=\s*functions\.([a-zA-Z_][a-zA-Z0-9_]*)",
-        re.IGNORECASE,
-    )
 
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
-        AstrProvider.__init__(self, provider_config, provider_settings)
+        normalized = normalize_provider_config(provider_config)
+        AstrProvider.__init__(self, normalized.config, provider_settings)
+        for warning in normalized.warnings:
+            logger.warning("%s", warning)
 
         self.api_keys: list[str] = AstrProvider.get_keys(self)
         self.chosen_api_key = self.api_keys[0] if self.api_keys else ""
 
-        self.timeout = provider_config.get("timeout", 120)
-        if isinstance(self.timeout, str):
-            self.timeout = int(self.timeout)
+        self.timeout = int(self.provider_config.get("timeout", 120))
 
-        self.custom_headers = provider_config.get("custom_headers", {})
-        if not isinstance(self.custom_headers, dict) or not self.custom_headers:
-            self.custom_headers = None
-        else:
-            for key in list(self.custom_headers.keys()):
-                self.custom_headers[key] = str(self.custom_headers[key])
+        custom_headers = self.provider_config.get("custom_headers") or {}
+        self.custom_headers = (
+            custom_headers if isinstance(custom_headers, dict) and custom_headers else None
+        )
 
         self.api_base = str(
-            provider_config.get("api_base", "https://api.openai.com/v1")
+            self.provider_config.get("api_base", "https://api.openai.com/v1")
         )
-        self.proxy = str(provider_config.get("proxy", "") or "")
+        self.proxy = str(self.provider_config.get("proxy", "") or "")
 
         self._http_client: httpx.AsyncClient | None = None
 
@@ -663,14 +120,26 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     @staticmethod
     def _normalize_tool_output_text(content: str) -> str:
         stripped = content.strip()
-        if not stripped or "\\" not in content:
+        if not stripped:
             return content
+
+        # Try to normalize JSON output to avoid inconsistent escaping (e.g. \\uXXXX)
+        # and keep the payload stable across retries.
+        if stripped[0] not in {'{', '[', '"'}:
+            return content
+
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
             return content
+
         if isinstance(parsed, (dict, list)):
-            return json.dumps(parsed, ensure_ascii=False, default=str)
+            return json.dumps(
+                parsed,
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
         if isinstance(parsed, str):
             return parsed
         return str(parsed)
@@ -708,7 +177,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     def _tool_fallback_enabled(self, tools: ToolSet | None) -> bool:
         if tools is None:
             return False
-        if not self._extract_allowed_tool_names(tools):
+        if not extract_allowed_tool_names(tools):
             return False
         raw = self.provider_config.get("tool_fallback_enabled", True)
         return self._coerce_bool(raw, True)
@@ -747,174 +216,6 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     def _tool_fallback_stream_buffer_enabled(self) -> bool:
         raw = self.provider_config.get("tool_fallback_stream_buffer", True)
         return self._coerce_bool(raw, True)
-
-    @staticmethod
-    def _extract_allowed_tool_names(tools: ToolSet | None) -> set[str]:
-        if tools is None:
-            return set()
-        names: set[str] = set()
-        func_list = getattr(tools, "func_list", None)
-        if not isinstance(func_list, list):
-            return names
-        for tool in func_list:
-            name = getattr(tool, "name", None)
-            if isinstance(name, str) and name:
-                names.add(name)
-        return names
-
-    @staticmethod
-    def _extract_json_object_after_index(
-        text: str, start_idx: int
-    ) -> tuple[str | None, int]:
-        obj_start: int | None = None
-        depth = 0
-        in_string = False
-        escaping = False
-
-        for idx in range(start_idx, len(text)):
-            ch = text[idx]
-            if obj_start is None:
-                if ch == "{":
-                    obj_start = idx
-                    depth = 1
-                continue
-
-            if in_string:
-                if escaping:
-                    escaping = False
-                    continue
-                if ch == "\\":
-                    escaping = True
-                    continue
-                if ch == '"':
-                    in_string = False
-                continue
-
-            if ch == '"':
-                in_string = True
-                continue
-            if ch == "{":
-                depth += 1
-                continue
-            if ch == "}":
-                depth -= 1
-                if depth == 0 and obj_start is not None:
-                    return text[obj_start : idx + 1], idx + 1
-
-        return None, start_idx
-
-    def _parse_pseudo_tool_calls(
-        self,
-        text: str,
-        *,
-        allowed_tool_names: set[str],
-    ) -> list[dict[str, Any]]:
-        parsed_calls: list[dict[str, Any]] = []
-        if not text:
-            return parsed_calls
-
-        use_allowlist = bool(allowed_tool_names)
-        for match in self._PSEUDO_TOOL_CALL_RE.finditer(text):
-            tool_name = match.group(1)
-            if use_allowlist and tool_name not in allowed_tool_names:
-                continue
-            raw_json, _ = self._extract_json_object_after_index(text, match.end())
-            if not raw_json:
-                continue
-            try:
-                arguments_obj = json.loads(raw_json)
-            except json.JSONDecodeError:
-                continue
-
-            if not isinstance(arguments_obj, dict):
-                arguments_obj = {"_raw": raw_json}
-
-            parsed_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                    "name": tool_name,
-                    "arguments": arguments_obj,
-                    "raw_arguments": raw_json,
-                }
-            )
-        return parsed_calls
-
-    def _convert_pseudo_calls_to_llm_response(
-        self,
-        llm_response: LLMResponse,
-        parsed_calls: list[dict[str, Any]],
-    ) -> LLMResponse:
-        converted = LLMResponse(role="tool", completion_text="")
-        converted.id = llm_response.id
-        converted.usage = llm_response.usage
-        converted.reasoning_content = llm_response.reasoning_content
-        converted.reasoning_signature = llm_response.reasoning_signature
-        converted.tools_call_ids = [str(item["id"]) for item in parsed_calls]
-        converted.tools_call_name = [str(item["name"]) for item in parsed_calls]
-        converted.tools_call_args = [item["arguments"] for item in parsed_calls]
-
-        raw_completion: dict[str, Any]
-        if isinstance(llm_response.raw_completion, dict):
-            raw_completion = dict(llm_response.raw_completion)
-        else:
-            raw_completion = {"upstream_raw_completion": llm_response.raw_completion}
-        raw_completion["pseudo_tool_call_detected"] = True
-        raw_completion["pseudo_tool_calls"] = [
-            {
-                "id": str(item["id"]),
-                "name": str(item["name"]),
-                "raw_arguments": str(item["raw_arguments"]),
-            }
-            for item in parsed_calls
-        ]
-        converted.raw_completion = raw_completion
-        return converted
-
-    def _maybe_parse_pseudo_tool_calls(
-        self,
-        llm_response: LLMResponse,
-        tools: ToolSet | None,
-    ) -> LLMResponse | None:
-        if llm_response.tools_call_name:
-            return None
-        text = llm_response.completion_text
-        if not isinstance(text, str) or not text.strip():
-            return None
-        allowed_tool_names = self._extract_allowed_tool_names(tools)
-        parsed_calls = self._parse_pseudo_tool_calls(
-            text,
-            allowed_tool_names=allowed_tool_names,
-        )
-        if not parsed_calls and self._PSEUDO_TOOL_CALL_RE.search(text):
-            if allowed_tool_names:
-                parsed_calls = self._parse_pseudo_tool_calls(
-                    text,
-                    allowed_tool_names=set(),
-                )
-                if parsed_calls:
-                    logger.warning(
-                        "Detected pseudo tool-call text with undeclared tool names, converted without allow-list guard. tools=%s",
-                        [item["name"] for item in parsed_calls],
-                    )
-            if not parsed_calls:
-                logger.warning(
-                    "Detected pseudo tool-call marker but failed to parse tool-call JSON arguments."
-                )
-        if not parsed_calls:
-            return None
-        logger.warning(
-            "Detected pseudo tool-call text, converted to structured tool calls. tools=%s",
-            [item["name"] for item in parsed_calls],
-        )
-        return self._convert_pseudo_calls_to_llm_response(llm_response, parsed_calls)
-
-    def _looks_like_pseudo_tool_call_text(self, llm_response: LLMResponse) -> bool:
-        if llm_response.tools_call_name:
-            return False
-        text = llm_response.completion_text
-        if not isinstance(text, str) or not text.strip():
-            return False
-        return bool(self._PSEUDO_TOOL_CALL_RE.search(text))
 
     @staticmethod
     def _convert_message_content(
@@ -1219,93 +520,16 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     body: dict[str, Any] | str = json.loads(raw_text)
                 except json.JSONDecodeError:
                     body = raw_text
-                raise _UpstreamResponsesError(
+                raise UpstreamResponsesError(
                     f"Responses API HTTP {response.status_code}: {raw_text[:512]}",
                     status_code=response.status_code,
                     body=body,
                     response_text=raw_text,
                 )
-
-            current_event_type: str | None = None
-            current_data_lines: list[str] = []
-
-            def _parse_event_data(
-                *,
-                event_type_hint: str | None,
-                data_lines: list[str],
-            ) -> tuple[str, dict[str, Any]] | None:
-                if not data_lines:
-                    return None
-                data_str = "\n".join(data_lines)
-                if data_str == "[DONE]":
-                    return ("[DONE]", {})
-                try:
-                    event_data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Responses SSE JSON decode failed: %s",
-                        data_str[:200],
-                    )
-                    return None
-
-                if isinstance(event_data, dict) and "error" in event_data:
-                    err = event_data.get("error", {})
-                    err_code = ""
-                    err_msg = ""
-                    if isinstance(err, dict):
-                        err_code = str(err.get("code") or "")
-                        err_msg = str(err.get("message") or "")
-                    raise _UpstreamResponsesError(
-                        f"Responses SSE error {err_code}: {err_msg}",
-                        body=event_data,
-                        response_text=data_str,
-                    )
-
-                if not isinstance(event_data, dict):
-                    return None
-                event_type = event_type_hint or str(event_data.get("type") or "")
-                if not event_type:
-                    return None
-                return event_type, event_data
-
-            def _flush_current_event() -> tuple[str, dict[str, Any]] | None:
-                nonlocal current_event_type, current_data_lines
-                parsed = _parse_event_data(
-                    event_type_hint=current_event_type,
-                    data_lines=current_data_lines,
-                )
-                current_event_type = None
-                current_data_lines = []
-                return parsed
-
-            async for raw_line in response.aiter_lines():
-                line = raw_line.rstrip("\r")
-                if not line:
-                    parsed = _flush_current_event()
-                    if parsed is None:
-                        continue
-                    if parsed[0] == "[DONE]":
-                        break
-                    yield parsed
-                    continue
-                if line.startswith(":"):
-                    continue
-                if line.startswith("event:"):
-                    current_event_type = line[6:].strip()
-                    continue
-                if line.startswith("data:"):
-                    data_segment = line[5:]
-                    if data_segment.startswith(" "):
-                        data_segment = data_segment[1:]
-                    current_data_lines.append(data_segment)
-                    continue
-                # Ignore non-data fields like id/retry.
-                if line.startswith("id:") or line.startswith("retry:"):
-                    continue
-
-            parsed = _flush_current_event()
-            if parsed and parsed[0] != "[DONE]":
-                yield parsed
+            async for event_type, event_data in iter_responses_sse_events(
+                response.aiter_lines()
+            ):
+                yield event_type, event_data
 
     async def _query_stream(
         self,
@@ -1324,8 +548,12 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             response_format=response_format,
             tool_choice_override=tool_choice_override,
         )
-        processor = _ResponsesStreamProcessor(
-            model=str(payloads.get("model") or self.get_model())
+        processor = ResponsesStreamAccumulator(
+            model=str(payloads.get("model") or self.get_model()),
+            debug_events=self._coerce_bool(
+                self.provider_config.get("debug_sse_events", False), False
+            ),
+            max_text_chars=int(self.provider_config.get("max_output_chars", 200_000)),
         )
 
         async for event_type, event_data in self._iter_responses_sse(
@@ -1499,7 +727,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         candidates = self._extract_error_text_candidates(e)
         joined = "\n".join(candidates)
         status_code = getattr(e, "status_code", None)
-        if status_code is None and isinstance(e, _UpstreamResponsesError):
+        if status_code is None and isinstance(e, UpstreamResponsesError):
             status_code = e.status_code
 
         if status_code in (401, 403):
@@ -1521,7 +749,13 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         if status_code == 429 or "429" in joined:
             logger.warning("Responses API rate limited, rotating key and retrying.")
             if retry_cnt < max_retries - 1:
-                await asyncio.sleep(1)
+                backoff_s = compute_backoff_seconds(
+                    attempt=retry_cnt,
+                    base_seconds=1.0,
+                    max_seconds=10.0,
+                    jitter_ratio=0.2,
+                )
+                await asyncio.sleep(backoff_s)
             if chosen_key in available_api_keys:
                 available_api_keys.remove(chosen_key)
             if available_api_keys:
@@ -1590,9 +824,15 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             )
 
         if is_connection_error(e):
-            log_connection_failure("OpenAI", e, self.proxy)
+            log_connection_failure("OpenAI", e, redact_proxy_url(self.proxy) or "")
             if retry_cnt < max_retries - 1:
-                await asyncio.sleep(1)
+                backoff_s = compute_backoff_seconds(
+                    attempt=retry_cnt,
+                    base_seconds=1.0,
+                    max_seconds=10.0,
+                    jitter_ratio=0.2,
+                )
+                await asyncio.sleep(backoff_s)
                 return (
                     False,
                     chosen_key,
@@ -1622,6 +862,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         retry_cnt = 0
 
         for retry_cnt in range(max_retries):
+            attempt_no = retry_cnt + 1
+            attempt_start = time.perf_counter()
             try:
                 self.chosen_api_key = chosen_key
                 last_chunk: LLMResponse | None = None
@@ -1636,9 +878,42 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     last_chunk = resp
                 if last_chunk is None:
                     raise Exception("Empty responses stream")
+                duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                log_usage_enabled = self._coerce_bool(
+                    self.provider_config.get("log_usage", False), False
+                )
+                usage_summary = None
+                if log_usage_enabled and last_chunk.usage is not None:
+                    usage_summary = {
+                        "input_other": last_chunk.usage.input_other,
+                        "input_cached": last_chunk.usage.input_cached,
+                        "output": last_chunk.usage.output,
+                    }
+                logger.info(
+                    "Responses request succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
+                    attempt_no,
+                    duration_ms,
+                    None,
+                    getattr(last_chunk, "id", None),
+                    payloads.get("model"),
+                    False,
+                    bool(func_tool),
+                    usage_summary,
+                )
                 return last_chunk, func_tool
             except Exception as e:
                 last_exception = e
+                duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                logger.warning(
+                    "Responses request failed. attempt=%s duration_ms=%s error_type=%s status_code=%s model=%s stream=%s tool_enabled=%s",
+                    attempt_no,
+                    duration_ms,
+                    error_type(e),
+                    getattr(e, "status_code", None),
+                    payloads.get("model"),
+                    False,
+                    bool(func_tool),
+                )
                 (
                     _,
                     chosen_key,
@@ -1699,20 +974,19 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             tool_choice_override=None,
         )
 
+        tool_names = extract_allowed_tool_names(effective_func_tool)
+        tools_available = bool(tool_names)
         has_tool_context = effective_func_tool is not None
         tool_fallback_enabled = self._tool_fallback_enabled(effective_func_tool)
         tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
-        allow_parse = has_tool_context
+        allow_parse = tools_available
         allow_retry = tool_fallback_enabled and tool_fallback_mode in {
             "parse_then_retry",
             "retry_only",
         }
 
-        if allow_parse:
-            converted = self._maybe_parse_pseudo_tool_calls(
-                llm_response,
-                effective_func_tool,
-            )
+        if allow_parse and looks_like_pseudo_tool_call_text(llm_response):
+            converted = maybe_convert_pseudo_tool_calls(llm_response, tools=effective_func_tool)
             if converted is not None:
                 llm_response = converted
 
@@ -1724,7 +998,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         while (
             allow_retry
             and tool_fallback_remaining > 0
-            and self._looks_like_pseudo_tool_call_text(llm_response)
+            and looks_like_pseudo_tool_call_text(llm_response)
             and not llm_response.tools_call_name
         ):
             tool_fallback_remaining -= 1
@@ -1741,11 +1015,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 response_format=response_format,
                 tool_choice_override=force_tool_choice,
             )
-            if allow_parse:
-                converted = self._maybe_parse_pseudo_tool_calls(
-                    llm_response,
-                    effective_func_tool,
-                )
+            if allow_parse and looks_like_pseudo_tool_call_text(llm_response):
+                converted = maybe_convert_pseudo_tool_calls(llm_response, tools=effective_func_tool)
                 if converted is not None:
                     llm_response = converted
             if llm_response.tools_call_name:
@@ -1787,13 +1058,13 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         has_tool_context = func_tool is not None
         tool_fallback_enabled = self._tool_fallback_enabled(func_tool)
         tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
-        allow_parse = has_tool_context
+        allow_parse = bool(extract_allowed_tool_names(func_tool))
         allow_retry = tool_fallback_enabled and tool_fallback_mode in {
             "parse_then_retry",
             "retry_only",
         }
         stream_buffer_enabled = (
-            has_tool_context and self._tool_fallback_stream_buffer_enabled()
+            allow_parse and self._tool_fallback_stream_buffer_enabled()
         )
 
         # Keep old immediate-yield behavior when stream buffering is disabled.
@@ -1808,7 +1079,10 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             retry_cnt = 0
 
             for retry_cnt in range(max_retries):
+                attempt_no = retry_cnt + 1
+                attempt_start = time.perf_counter()
                 yielded_any = False
+                last_response: LLMResponse | None = None
                 try:
                     self.chosen_api_key = chosen_key
                     async for response in self._query_stream(
@@ -1822,18 +1096,50 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                         if (
                             not response.is_chunk
                             and allow_parse
+                            and looks_like_pseudo_tool_call_text(response)
                         ):
-                            converted = self._maybe_parse_pseudo_tool_calls(
-                                response,
-                                func_tool,
-                            )
+                            converted = maybe_convert_pseudo_tool_calls(response, tools=func_tool)
                             if converted is not None:
                                 response = converted
                         yielded_any = True
+                        last_response = response
                         yield response
+                    duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                    log_usage_enabled = self._coerce_bool(
+                        self.provider_config.get("log_usage", False), False
+                    )
+                    usage_summary = None
+                    if log_usage_enabled and last_response and last_response.usage is not None:
+                        usage_summary = {
+                            "input_other": last_response.usage.input_other,
+                            "input_cached": last_response.usage.input_cached,
+                            "output": last_response.usage.output,
+                        }
+                    logger.info(
+                        "Responses stream succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
+                        attempt_no,
+                        duration_ms,
+                        None,
+                        getattr(last_response, "id", None) if last_response else None,
+                        payloads.get("model"),
+                        True,
+                        bool(func_tool),
+                        usage_summary,
+                    )
                     break
                 except Exception as e:
                     last_exception = e
+                    duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                    logger.warning(
+                        "Responses stream failed. attempt=%s duration_ms=%s error_type=%s status_code=%s model=%s stream=%s tool_enabled=%s",
+                        attempt_no,
+                        duration_ms,
+                        error_type(e),
+                        getattr(e, "status_code", None),
+                        payloads.get("model"),
+                        True,
+                        bool(func_tool),
+                    )
                     if yielded_any:
                         raise
                     (
@@ -1878,8 +1184,22 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         last_exception: Exception | None = None
         retry_cnt = 0
         for retry_cnt in range(max_retries):
-            buffered_responses: list[LLMResponse] = []
+            attempt_no = retry_cnt + 1
+            attempt_start = time.perf_counter()
             try:
+                released = False
+                yielded_any = False
+                last_response: LLMResponse | None = None
+                buffered_text = ""
+                buffered_responses: list[LLMResponse] = []
+                release_after_chars = 64
+                max_buffer_chars = int(
+                    self.provider_config.get("stream_buffer_max_chars", 20_000)
+                )
+                max_buffer_responses = int(
+                    self.provider_config.get("stream_buffer_max_responses", 512)
+                )
+
                 self.chosen_api_key = chosen_key
                 async for response in self._query_stream(
                     payloads,
@@ -1889,16 +1209,105 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     response_format=response_format,
                     tool_choice_override=tool_choice_override,
                 ):
+                    if released:
+                        if response.is_chunk:
+                            if looks_like_pseudo_tool_call_text(response):
+                                raise Exception(
+                                    "Pseudo tool-call text detected after streaming started; abort to avoid leakage."
+                                )
+                            yielded_any = True
+                            yield response
+                            continue
+
+                        if looks_like_pseudo_tool_call_text(response):
+                            if not allow_parse:
+                                raise Exception(
+                                    "Pseudo tool-call text detected but tool parsing is disabled; abort to avoid leakage."
+                                )
+                            converted = maybe_convert_pseudo_tool_calls(
+                                response, tools=func_tool
+                            )
+                            if converted is None:
+                                raise Exception(
+                                    "Pseudo tool-call text detected but failed to convert; abort to avoid leakage."
+                                )
+                            response = converted
+
+                        yielded_any = True
+                        last_response = response
+                        yield response
+                        continue
+
                     buffered_responses.append(response)
+                    if response.is_chunk and isinstance(response.completion_text, str):
+                        buffered_text += response.completion_text
+
+                    pseudo_suspected = False
+                    if buffered_text:
+                        preview = buffered_text[-256:]
+                        pseudo_suspected = looks_like_pseudo_tool_call_text(
+                            LLMResponse(role="assistant", completion_text=preview)
+                        )
+
+                    if (
+                        len(buffered_text) > max_buffer_chars
+                        or len(buffered_responses) > max_buffer_responses
+                    ):
+                        if pseudo_suspected:
+                            raise Exception(
+                                "Stream buffer exceeded while pseudo tool-call is suspected; abort to avoid leakage."
+                            )
+                        for item in buffered_responses:
+                            yielded_any = True
+                            last_response = item
+                            yield item
+                        buffered_responses = []
+                        released = True
+                        continue
+
+                    if pseudo_suspected:
+                        # Keep buffering to ensure we don't leak any pseudo-call prefix.
+                        continue
+
+                    if len(buffered_text) >= release_after_chars:
+                        for item in buffered_responses:
+                            yielded_any = True
+                            last_response = item
+                            yield item
+                        buffered_responses = []
+                        released = True
 
                 if not buffered_responses:
-                    raise Exception("Empty responses stream")
+                    if not yielded_any:
+                        raise Exception("Empty responses stream")
+                    duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                    log_usage_enabled = self._coerce_bool(
+                        self.provider_config.get("log_usage", False), False
+                    )
+                    usage_summary = None
+                    if log_usage_enabled and last_response and last_response.usage is not None:
+                        usage_summary = {
+                            "input_other": last_response.usage.input_other,
+                            "input_cached": last_response.usage.input_cached,
+                            "output": last_response.usage.output,
+                        }
+                    logger.info(
+                        "Responses stream succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
+                        attempt_no,
+                        duration_ms,
+                        None,
+                        getattr(last_response, "id", None) if last_response else None,
+                        payloads.get("model"),
+                        True,
+                        bool(func_tool),
+                        usage_summary,
+                    )
+                    return
 
                 final_response = buffered_responses[-1]
-                if allow_parse:
-                    converted = self._maybe_parse_pseudo_tool_calls(
-                        final_response,
-                        func_tool,
+                if allow_parse and looks_like_pseudo_tool_call_text(final_response):
+                    converted = maybe_convert_pseudo_tool_calls(
+                        final_response, tools=func_tool
                     )
                     if converted is not None:
                         final_response = converted
@@ -1908,7 +1317,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 if (
                     allow_retry
                     and tool_fallback_remaining > 0
-                    and self._looks_like_pseudo_tool_call_text(final_response)
+                    and looks_like_pseudo_tool_call_text(final_response)
                     and not final_response.tools_call_name
                 ):
                     tool_fallback_remaining -= 1
@@ -1923,11 +1332,47 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 if buffered_responses and buffered_responses[-1] is not final_response:
                     buffered_responses[-1] = final_response
 
-                for response in buffered_responses:
-                    yield response
+                for item in buffered_responses:
+                    last_response = item
+                    yield item
+                duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                log_usage_enabled = self._coerce_bool(
+                    self.provider_config.get("log_usage", False), False
+                )
+                usage_summary = None
+                if log_usage_enabled and last_response and last_response.usage is not None:
+                    usage_summary = {
+                        "input_other": last_response.usage.input_other,
+                        "input_cached": last_response.usage.input_cached,
+                        "output": last_response.usage.output,
+                    }
+                logger.info(
+                    "Responses stream succeeded. attempt=%s duration_ms=%s error_type=%s response_id=%s model=%s stream=%s tool_enabled=%s usage=%s",
+                    attempt_no,
+                    duration_ms,
+                    None,
+                    getattr(last_response, "id", None) if last_response else None,
+                    payloads.get("model"),
+                    True,
+                    bool(func_tool),
+                    usage_summary,
+                )
                 return
             except Exception as e:
                 last_exception = e
+                duration_ms = int((time.perf_counter() - attempt_start) * 1000)
+                logger.warning(
+                    "Responses stream failed. attempt=%s duration_ms=%s error_type=%s status_code=%s model=%s stream=%s tool_enabled=%s",
+                    attempt_no,
+                    duration_ms,
+                    error_type(e),
+                    getattr(e, "status_code", None),
+                    payloads.get("model"),
+                    True,
+                    bool(func_tool),
+                )
+                if yielded_any:
+                    raise
                 (
                     _,
                     chosen_key,

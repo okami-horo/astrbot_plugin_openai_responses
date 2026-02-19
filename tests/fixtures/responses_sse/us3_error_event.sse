@@ -1,0 +1,8 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_us3_1"}}
+
+event: error
+data: {"type":"error","error":{"message":"Invalid API key provided","type":"invalid_request_error","code":"invalid_api_key"}}
+
+data: [DONE]
+

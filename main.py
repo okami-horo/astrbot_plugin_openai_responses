@@ -57,6 +57,10 @@ def _register_provider() -> None:
         "tool_fallback_retry_attempts": 1,
         "tool_fallback_force_tool_choice": "required",
         "tool_fallback_stream_buffer": True,
+        "log_usage": False,
+        "max_output_chars": 200000,
+        "stream_buffer_max_chars": 20000,
+        "stream_buffer_max_responses": 512,
     }
 
     register_or_replace_provider_adapter(
