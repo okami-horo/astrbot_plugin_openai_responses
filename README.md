@@ -40,48 +40,6 @@
 
 最后将 `provider_settings.default_provider_id` 指向你刚创建的 provider `id`。
 
-### 进阶：对应到 `cmd_config.json`（provider_sources + provider）
-
-如果你使用的是两段式配置（`provider_sources` + `provider`），可以参考：
-
-```json
-{
-  "provider_sources": [
-    {
-      "id": "openai_responses_plugin",
-      "type": "openai_responses_plugin",
-      "provider": "openai",
-      "provider_type": "chat_completion",
-      "enable": true,
-      "key": ["sk-..."],
-      "api_base": "https://api.openai.com/v1",
-      "timeout": 120,
-      "proxy": "",
-      "custom_headers": {},
-      "reasoning_effort": "",
-      "custom_extra_body": {},
-      "tool_fallback_enabled": true,
-      "tool_fallback_mode": "parse_then_retry",
-      "tool_fallback_retry_attempts": 1,
-      "tool_fallback_force_tool_choice": "required",
-      "tool_fallback_stream_buffer": true,
-      "log_usage": false,
-      "max_output_chars": 200000,
-      "stream_buffer_max_chars": 20000,
-      "stream_buffer_max_responses": 512
-    }
-  ],
-  "provider": [
-    {
-      "id": "openai_responses_plugin/gpt-4o-mini",
-      "provider_source_id": "openai_responses_plugin",
-      "model": "gpt-4o-mini",
-      "enable": true
-    }
-  ]
-}
-```
-
 ## 工具调用兜底说明
 
 - 触发条件：当前轮 **有工具可用**，且模型 **未返回结构化 tool calls**，但返回文本里出现类似 `assistant to=functions.xxx` 的“伪调用”标记。
@@ -91,15 +49,6 @@
   - `retry_only`：不做本地解析，只做强制工具重试
   - `parse_only`：只做本地解析，不重试
 - 流式注意：`tool_fallback_stream_buffer=true` 时，插件会在流式输出的早期阶段进行“疑似伪调用”检测；仅当判定为疑似伪调用时才进入缓冲/重试流程，从而在避免伪调用文本泄露的同时，尽量降低正常流式的首字延迟。
-
-## 已知限制
-
-- 本插件不尝试覆盖/替换 AstrBot 内置的 OpenAI ChatCompletions Provider；它只提供一个新的 Provider `type`。
-- 插件卸载/禁用后，如配置仍引用该 provider，建议重启并移除相关 provider 配置后再启动。
-
-## 迁移说明
-
-- 若升级后日志出现配置字段迁移/弃用提示，可参考 `specs/001-redesign-responses-provider/quickstart.md` 中的“迁移策略”与字段映射表进行调整。
 
 ## 开发与测试
 
