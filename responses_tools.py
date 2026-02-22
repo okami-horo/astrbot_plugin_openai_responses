@@ -11,7 +11,7 @@ from astrbot.core.provider.entities import LLMResponse
 
 
 _PSEUDO_TOOL_CALL_RE = re.compile(
-    r"assistant\s+to\s*=\s*functions\.([a-zA-Z_][a-zA-Z0-9_]*)",
+    r"(?:^|\n)\s*assistant\s+to\s*=\s*functions\.([a-zA-Z_][a-zA-Z0-9_]*)",
     re.IGNORECASE,
 )
 
@@ -180,4 +180,3 @@ def looks_like_pseudo_tool_call_text(llm_response: LLMResponse) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
     return bool(_PSEUDO_TOOL_CALL_RE.search(text))
-

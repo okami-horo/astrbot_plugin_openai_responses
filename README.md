@@ -27,6 +27,13 @@
 - `tool_fallback_retry_attempts`: 默认 `1`，伪调用时最多重试次数（建议 `0~3`）
 - `tool_fallback_force_tool_choice`: 默认 `required`，重试时写入 `tool_choice`
 - `tool_fallback_stream_buffer`: 默认 `true`，流式下先缓冲再输出，避免伪调用文本泄露给用户
+- `codex_mode`: 默认 `auto`，可选 `auto/openai/chatgpt`；用于 Codex 双通道适配（自动或强制）
+- `codex_transport`: 默认 `auto`，可选 `auto/sse/websocket`（当前以 SSE 为主，websocket 预留）
+- `codex_strict_tool_call`: 默认 `true`，Codex 模式下检测到伪工具调用文本时直接拒绝，避免 JSON 泄露
+- `codex_disable_pseudo_tool_call`: 默认 `true`，Codex 模式下禁用“文本伪工具调用转结构化”的旧兜底
+- `codex_turn_state_enabled`: 默认 `true`，启用回合状态追踪与 `prompt_cache_key`
+- `codex_parallel_tool_calls`: 默认 `true`，Codex 模式下请求中写入 `parallel_tool_calls`
+- `codex_context_prune_strategy`: 默认 `pair_aware`，上下文超限时按工具调用对（call/output）裁剪；可选 `legacy`
 - `log_usage`: 默认 `false`，是否在日志中记录 token 用量（仅记录数值，不记录明文内容；仍遵循脱敏规则）
 - `max_output_chars`: 默认 `200000`，单次回复累计输出的最大字符数（超过将截断，用于防止极端情况下内存占用过高）
 - `stream_buffer_max_chars`: 默认 `20000`，流式“疑似伪调用”缓冲阶段允许累计的最大字符数（超过将触发降级/中止以避免卡死）

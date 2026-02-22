@@ -3,6 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+try:
+    from responses_mode import normalize_codex_mode
+except ImportError:  # pragma: no cover
+    from .responses_mode import normalize_codex_mode
+
+try:
+    from responses_turn_state import normalize_prune_strategy
+except ImportError:  # pragma: no cover
+    from .responses_turn_state import normalize_prune_strategy
+
 
 _TOOL_FALLBACK_MODES = {"parse_then_retry", "retry_only", "parse_only"}
 
@@ -129,6 +139,50 @@ def normalize_provider_config(raw_config: dict[str, Any]) -> ConfigNormalization
         config.get("tool_fallback_stream_buffer", True),
         True,
     )
+
+    codex_mode = normalize_codex_mode(config.get("codex_mode", "auto"), default="auto")
+    if codex_mode == "auto" and isinstance(config.get("codex_mode"), str):
+        raw_mode = str(config.get("codex_mode")).strip().lower()
+        if raw_mode and raw_mode not in {"auto", "openai", "chatgpt"}:
+            warnings.append(
+                f"Unknown `codex_mode` value {raw_mode!r}; fallback to auto."
+            )
+    config["codex_mode"] = codex_mode
+
+    codex_transport_raw = config.get("codex_transport", "auto")
+    if isinstance(codex_transport_raw, str):
+        codex_transport = codex_transport_raw.strip().lower()
+    else:
+        codex_transport = "auto"
+    if codex_transport not in {"auto", "sse", "websocket"}:
+        warnings.append(
+            f"Unknown `codex_transport` value {codex_transport_raw!r}; fallback to auto."
+        )
+        codex_transport = "auto"
+    config["codex_transport"] = codex_transport
+
+    config["codex_strict_tool_call"] = _coerce_bool(
+        config.get("codex_strict_tool_call", True), True
+    )
+    config["codex_disable_pseudo_tool_call"] = _coerce_bool(
+        config.get("codex_disable_pseudo_tool_call", True), True
+    )
+    config["codex_turn_state_enabled"] = _coerce_bool(
+        config.get("codex_turn_state_enabled", True), True
+    )
+    config["codex_parallel_tool_calls"] = _coerce_bool(
+        config.get("codex_parallel_tool_calls", True), True
+    )
+    codex_prune_raw = config.get("codex_context_prune_strategy", "pair_aware")
+    codex_prune = normalize_prune_strategy(codex_prune_raw, default="pair_aware")
+    if codex_prune == "pair_aware" and isinstance(codex_prune_raw, str):
+        raw_prune = codex_prune_raw.strip().lower()
+        if raw_prune and raw_prune not in {"pair_aware", "legacy"}:
+            warnings.append(
+                "Unknown `codex_context_prune_strategy` value "
+                f"{raw_prune!r}; fallback to pair_aware."
+            )
+    config["codex_context_prune_strategy"] = codex_prune
 
     config["log_usage"] = _coerce_bool(config.get("log_usage", False), False)
 

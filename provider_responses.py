@@ -61,6 +61,16 @@ except ImportError:  # pragma: no cover
         maybe_convert_pseudo_tool_calls,
     )
 
+try:
+    from responses_mode import RuntimeModeResolution, resolve_runtime_mode
+except ImportError:  # pragma: no cover
+    from .responses_mode import RuntimeModeResolution, resolve_runtime_mode
+
+try:
+    from responses_turn_state import ResponsesTurnState
+except ImportError:  # pragma: no cover
+    from .responses_turn_state import ResponsesTurnState
+
 
 class ProviderOpenAIResponsesPlugin(AstrProvider):
     """OpenAI Responses API provider adapter for plugin distribution."""
@@ -90,11 +100,16 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         self.proxy = str(self.provider_config.get("proxy", "") or "")
 
         self._http_client: httpx.AsyncClient | None = None
+        self._turn_state = ResponsesTurnState()
 
         model = provider_config.get("model")
         if not model:
             model = "gpt-4o-mini"
         self.set_model(str(model))
+        if str(self.provider_config.get("codex_transport", "auto")).lower() == "websocket":
+            logger.warning(
+                "codex_transport=websocket is reserved but not implemented yet; fallback to SSE."
+            )
 
     def _get_http_client(self) -> httpx.AsyncClient:
         if self._http_client is not None:
@@ -216,6 +231,122 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     def _tool_fallback_stream_buffer_enabled(self) -> bool:
         raw = self.provider_config.get("tool_fallback_stream_buffer", True)
         return self._coerce_bool(raw, True)
+
+    def _resolve_runtime_mode(self, *, model: str) -> RuntimeModeResolution:
+        return resolve_runtime_mode(
+            model=model,
+            api_base=self.api_base,
+            codex_mode=str(self.provider_config.get("codex_mode", "auto")),
+        )
+
+    def _codex_disable_pseudo_tool_call(self) -> bool:
+        raw = self.provider_config.get("codex_disable_pseudo_tool_call", True)
+        return self._coerce_bool(raw, True)
+
+    def _codex_strict_tool_call(self) -> bool:
+        raw = self.provider_config.get("codex_strict_tool_call", True)
+        return self._coerce_bool(raw, True)
+
+    def _codex_parallel_tool_calls_enabled(self) -> bool:
+        raw = self.provider_config.get("codex_parallel_tool_calls", True)
+        return self._coerce_bool(raw, True)
+
+    def _codex_turn_state_enabled(self) -> bool:
+        raw = self.provider_config.get("codex_turn_state_enabled", True)
+        return self._coerce_bool(raw, True)
+
+    def _codex_context_prune_strategy(self) -> str:
+        raw = self.provider_config.get("codex_context_prune_strategy", "pair_aware")
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"pair_aware", "legacy"}:
+                return normalized
+        return "pair_aware"
+
+    @staticmethod
+    def _extract_message_text_for_instructions(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        parts.append(text)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "")
+                if item_type in {"text", "input_text", "output_text"}:
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+                    continue
+                if item_type == "refusal":
+                    refusal = str(item.get("refusal") or item.get("text") or "").strip()
+                    if refusal:
+                        parts.append(refusal)
+                    continue
+                serialized = json.dumps(item, ensure_ascii=False, default=str).strip()
+                if serialized:
+                    parts.append(serialized)
+            return "\n".join(parts).strip()
+
+        if content is None:
+            return ""
+        return str(content).strip()
+
+    def _split_codex_instructions_from_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        instructions: list[str] = []
+        filtered_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            role = str(msg.get("role", "")).lower()
+            if role in {"system", "developer"}:
+                text = self._extract_message_text_for_instructions(msg.get("content"))
+                if text:
+                    instructions.append(text)
+                continue
+            filtered_messages.append(msg)
+
+        if not instructions:
+            return None, messages
+        return "\n\n".join(instructions), filtered_messages
+
+    def _record_turn_success(self, payloads: dict[str, Any], response: LLMResponse) -> None:
+        if not self._codex_turn_state_enabled():
+            return
+        if response is None:
+            return
+        raw_completion = (
+            response.raw_completion if isinstance(response.raw_completion, dict) else {}
+        )
+        tool_calls = raw_completion.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+        self._turn_state.note_success(
+            response_id=getattr(response, "id", None),
+            request_messages=list(payloads.get("messages") or []),
+            tool_calls=tool_calls,
+        )
+
+    async def _prune_context_on_context_length(
+        self,
+        context_query: list[dict[str, Any]],
+    ) -> None:
+        strategy = self._codex_context_prune_strategy()
+        if (
+            strategy == "pair_aware"
+            and self._turn_state.prune_messages_for_context_limit(
+                context_query, strategy=strategy
+            )
+        ):
+            return
+        await self.pop_record(context_query)
 
     @staticmethod
     def _convert_message_content(
@@ -444,11 +575,32 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
         if not isinstance(messages, list):
             raise ValueError("payloads.messages must be a list")
 
+        runtime_mode = self._resolve_runtime_mode(model=model)
+        instructions: str | None = None
+        message_items = messages
+        if runtime_mode.is_codex_chatgpt:
+            instructions, message_items = self._split_codex_instructions_from_messages(
+                messages
+            )
+
         request_body: dict[str, Any] = {
             "model": model,
-            "input": self._convert_chat_messages_to_responses_input(messages),
+            "input": self._convert_chat_messages_to_responses_input(message_items),
             "stream": True,
         }
+        if runtime_mode.is_codex_chatgpt and instructions:
+            request_body["instructions"] = instructions
+
+        if runtime_mode.is_codex_chatgpt and self._codex_turn_state_enabled():
+            prompt_cache_key = self._turn_state.build_prompt_cache_key(
+                session_id=(
+                    str(payloads.get("session_id"))
+                    if payloads.get("session_id") is not None
+                    else None
+                ),
+                messages=message_items,
+            )
+            request_body["prompt_cache_key"] = prompt_cache_key
 
         if tools:
             omit_empty_param_field = "gemini" in model.lower()
@@ -460,6 +612,12 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 request_body["tools"] = converted
                 if tool_choice_override is not None:
                     request_body["tool_choice"] = tool_choice_override
+                elif runtime_mode.is_codex_chatgpt:
+                    request_body["tool_choice"] = "auto"
+                if runtime_mode.is_codex_chatgpt:
+                    request_body["parallel_tool_calls"] = (
+                        self._codex_parallel_tool_calls_enabled()
+                    )
 
         effort_source = reasoning_effort
         if effort_source is None:
@@ -584,6 +742,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     async def _prepare_chat_payload(
         self,
         prompt: str | None,
+        session_id: str | None = None,
         image_urls: list[str] | None = None,
         contexts: list[dict] | list[Any] | None = None,
         system_prompt: str | None = None,
@@ -617,7 +776,11 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     context_query.extend(tcr.to_openai_messages())
 
         model = model or self.get_model()
-        payloads: dict[str, Any] = {"messages": context_query, "model": model}
+        payloads: dict[str, Any] = {
+            "messages": context_query,
+            "model": model,
+            "session_id": session_id,
+        }
         self._finally_convert_payload(payloads)
         return payloads, context_query
 
@@ -776,7 +939,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 "Context length exceeded, popping oldest records and retrying. records=%s",
                 len(context_query),
             )
-            await self.pop_record(context_query)
+            await self._prune_context_on_context_length(context_query)
             payloads["messages"] = context_query
             return (
                 False,
@@ -900,6 +1063,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     bool(func_tool),
                     usage_summary,
                 )
+                self._record_turn_success(payloads, last_chunk)
                 return last_chunk, func_tool
             except Exception as e:
                 last_exception = e
@@ -954,6 +1118,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     ) -> LLMResponse:
         payloads, _ = await self._prepare_chat_payload(
             prompt,
+            session_id,
             image_urls,
             contexts,
             system_prompt,
@@ -974,16 +1139,24 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             tool_choice_override=None,
         )
 
+        runtime_mode = self._resolve_runtime_mode(
+            model=str(payloads.get("model") or self.get_model())
+        )
+        codex_mode = runtime_mode.is_codex_chatgpt
         tool_names = extract_allowed_tool_names(effective_func_tool)
         tools_available = bool(tool_names)
-        has_tool_context = effective_func_tool is not None
+        strict_tool_call = codex_mode and tools_available and self._codex_strict_tool_call()
+        codex_disable_pseudo = (
+            codex_mode and tools_available and self._codex_disable_pseudo_tool_call()
+        )
         tool_fallback_enabled = self._tool_fallback_enabled(effective_func_tool)
         tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
-        allow_parse = tools_available
-        allow_retry = tool_fallback_enabled and tool_fallback_mode in {
-            "parse_then_retry",
-            "retry_only",
-        }
+        allow_parse = tools_available and not codex_disable_pseudo and not strict_tool_call
+        allow_retry = (
+            not codex_mode
+            and tool_fallback_enabled
+            and tool_fallback_mode in {"parse_then_retry", "retry_only"}
+        )
 
         if allow_parse and looks_like_pseudo_tool_call_text(llm_response):
             converted = maybe_convert_pseudo_tool_calls(llm_response, tools=effective_func_tool)
@@ -1022,6 +1195,17 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             if llm_response.tools_call_name:
                 break
 
+        if (
+            codex_mode
+            and tools_available
+            and looks_like_pseudo_tool_call_text(llm_response)
+            and not llm_response.tools_call_name
+        ):
+            logger.error(
+                "Codex mode detected pseudo tool-call text without structured tool call."
+            )
+            raise Exception("Codex 模式检测到伪工具调用文本，已中止以避免 JSON 泄露。")
+
         completion_text = llm_response.completion_text
         has_text = isinstance(completion_text, str) and bool(completion_text.strip())
         if not has_text and not llm_response.tools_call_args:
@@ -1044,6 +1228,7 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
     ) -> AsyncGenerator[LLMResponse, None]:
         payloads, context_query = await self._prepare_chat_payload(
             prompt,
+            session_id,
             image_urls,
             contexts,
             system_prompt,
@@ -1055,16 +1240,27 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
 
         reasoning_effort = kwargs.get("reasoning_effort")
         response_format = kwargs.get("response_format")
-        has_tool_context = func_tool is not None
+        runtime_mode = self._resolve_runtime_mode(
+            model=str(payloads.get("model") or self.get_model())
+        )
+        codex_mode = runtime_mode.is_codex_chatgpt
+        tools_available = bool(extract_allowed_tool_names(func_tool))
+        strict_tool_call = codex_mode and tools_available and self._codex_strict_tool_call()
+        codex_disable_pseudo = (
+            codex_mode and tools_available and self._codex_disable_pseudo_tool_call()
+        )
         tool_fallback_enabled = self._tool_fallback_enabled(func_tool)
         tool_fallback_mode = self._tool_fallback_mode() if tool_fallback_enabled else ""
-        allow_parse = bool(extract_allowed_tool_names(func_tool))
-        allow_retry = tool_fallback_enabled and tool_fallback_mode in {
-            "parse_then_retry",
-            "retry_only",
-        }
+        allow_parse = tools_available and not codex_disable_pseudo and not strict_tool_call
+        allow_retry = (
+            not codex_mode
+            and tool_fallback_enabled
+            and tool_fallback_mode in {"parse_then_retry", "retry_only"}
+        )
         stream_buffer_enabled = (
-            allow_parse and self._tool_fallback_stream_buffer_enabled()
+            (tools_available and self._tool_fallback_stream_buffer_enabled())
+            or strict_tool_call
+            or codex_disable_pseudo
         )
 
         # Keep old immediate-yield behavior when stream buffering is disabled.
@@ -1126,6 +1322,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                         bool(func_tool),
                         usage_summary,
                     )
+                    if last_response is not None:
+                        self._record_turn_success(payloads, last_response)
                     break
                 except Exception as e:
                     last_exception = e
@@ -1192,13 +1390,17 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 last_response: LLMResponse | None = None
                 buffered_text = ""
                 buffered_responses: list[LLMResponse] = []
-                release_after_chars = 64
                 max_buffer_chars = int(
                     self.provider_config.get("stream_buffer_max_chars", 20_000)
                 )
                 max_buffer_responses = int(
                     self.provider_config.get("stream_buffer_max_responses", 512)
                 )
+                if strict_tool_call or codex_disable_pseudo:
+                    # Buffer until stream end to avoid leaking pseudo-call text.
+                    release_after_chars = max_buffer_chars + 1
+                else:
+                    release_after_chars = 64
 
                 self.chosen_api_key = chosen_key
                 async for response in self._query_stream(
@@ -1302,9 +1504,21 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                         bool(func_tool),
                         usage_summary,
                     )
+                    if last_response is not None:
+                        self._record_turn_success(payloads, last_response)
                     return
 
                 final_response = buffered_responses[-1]
+                if (
+                    codex_mode
+                    and tools_available
+                    and looks_like_pseudo_tool_call_text(final_response)
+                    and not final_response.tools_call_name
+                ):
+                    raise Exception(
+                        "Codex 模式检测到伪工具调用文本，已中止以避免 JSON 泄露。"
+                    )
+
                 if allow_parse and looks_like_pseudo_tool_call_text(final_response):
                     converted = maybe_convert_pseudo_tool_calls(
                         final_response, tools=func_tool
@@ -1357,6 +1571,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     bool(func_tool),
                     usage_summary,
                 )
+                if last_response is not None:
+                    self._record_turn_success(payloads, last_response)
                 return
             except Exception as e:
                 last_exception = e

@@ -791,6 +791,32 @@ def test_build_responses_request_is_stateless_and_does_not_set_previous_response
     assert "previous_response_id" not in request
 
 
+def test_build_responses_request_codex_profile_sets_instructions_and_auto_tools():
+    provider = _make_provider(
+        overrides={
+            "api_base": "https://chatgpt.com/backend-api/codex",
+            "codex_mode": "auto",
+        }
+    )
+    tools = _make_tool_set()
+    payloads = {
+        "model": "gpt-5.2-codex",
+        "session_id": "sid-1",
+        "messages": [
+            {"role": "system", "content": "You are Codex."},
+            {"role": "user", "content": "hello"},
+        ],
+    }
+
+    request = provider._build_responses_request(payloads, tools)
+
+    assert request["instructions"] == "You are Codex."
+    assert request["tool_choice"] == "auto"
+    assert request["parallel_tool_calls"] is True
+    assert request["prompt_cache_key"] == "astrbot:sid-1"
+    assert request["input"][0]["role"] == "user"
+
+
 @pytest.mark.asyncio
 async def test_query_final_response_rotates_key_on_401_and_retries(monkeypatch):
     provider = _make_provider(overrides={"key": ["k1", "k2"]})
@@ -1110,3 +1136,128 @@ async def test_text_chat_stream_buffers_first_attempt_and_retries_on_pseudo_tool
     assert outputs[0].role == "tool"
     assert outputs[0].tools_call_name == ["test_tool"]
     assert outputs[0].tools_call_args == [{"q": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_text_chat_codex_mode_rejects_pseudo_tool_call_text(monkeypatch):
+    provider = _make_provider(
+        overrides={
+            "model": "gpt-5.2-codex",
+            "codex_mode": "chatgpt",
+        }
+    )
+    tools = _make_tool_set()
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        assert payloads["model"] == "gpt-5.2-codex"
+        assert tool_set is tools
+        yield LLMResponse(
+            role="assistant",
+            completion_text='assistant to=functions.test_tool\n{"q":"x"}',
+        )
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    with pytest.raises(Exception, match="伪工具调用文本"):
+        await provider.text_chat(prompt="hello", func_tool=tools, model="gpt-5.2-codex")
+
+
+@pytest.mark.asyncio
+async def test_text_chat_stream_codex_mode_rejects_pseudo_tool_call_text(monkeypatch):
+    provider = _make_provider(
+        overrides={
+            "model": "gpt-5.2-codex",
+            "codex_mode": "chatgpt",
+        }
+    )
+    tools = _make_tool_set()
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        assert payloads["model"] == "gpt-5.2-codex"
+        assert tool_set is tools
+        yield LLMResponse(
+            role="assistant",
+            completion_text="assistant to=functions.test_tool",
+            is_chunk=True,
+        )
+        yield LLMResponse(
+            role="assistant",
+            completion_text='assistant to=functions.test_tool\n{"q":"x"}',
+        )
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    with pytest.raises(Exception, match="伪工具调用文本"):
+        async for _ in provider.text_chat_stream(
+            prompt="hello",
+            func_tool=tools,
+            model="gpt-5.2-codex",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_text_chat_stream_codex_mode_without_tools_keeps_streaming(monkeypatch):
+    provider = _make_provider(
+        overrides={
+            "model": "gpt-5.2-codex",
+            "codex_mode": "chatgpt",
+            "codex_disable_pseudo_tool_call": True,
+        }
+    )
+    progress: list[str] = []
+
+    async def _fake_query_stream(
+        payloads,
+        tool_set,
+        *,
+        api_key,
+        reasoning_effort=None,
+        response_format=None,
+        tool_choice_override=None,
+    ):
+        assert payloads["model"] == "gpt-5.2-codex"
+        assert tool_set is None
+        progress.append("before_first_yield")
+        yield LLMResponse(
+            role="assistant",
+            completion_text="hello",
+            is_chunk=True,
+        )
+        progress.append("before_second_yield")
+        yield LLMResponse(
+            role="assistant",
+            completion_text="hello world",
+        )
+
+    monkeypatch.setattr(provider, "_query_stream", _fake_query_stream)
+
+    stream = provider.text_chat_stream(
+        prompt="hello",
+        func_tool=None,
+        model="gpt-5.2-codex",
+    )
+
+    first = await anext(stream)
+    assert first.is_chunk is True
+    assert progress == ["before_first_yield"]
+
+    second = await anext(stream)
+    assert second.is_chunk is False
+    assert progress == ["before_first_yield", "before_second_yield"]

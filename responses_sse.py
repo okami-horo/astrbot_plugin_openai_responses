@@ -60,6 +60,29 @@ async def iter_responses_sse_events(
                 response_text=data_str,
             )
 
+        if event_type in {"response.failed", "response.incomplete"}:
+            response_obj = event_data.get("response", {})
+            err_msg = ""
+            err_code = ""
+            if isinstance(response_obj, dict):
+                if event_type == "response.failed":
+                    err_obj = response_obj.get("error", {})
+                    if isinstance(err_obj, dict):
+                        err_msg = str(err_obj.get("message") or "")
+                        err_code = str(err_obj.get("code") or "")
+                elif event_type == "response.incomplete":
+                    details = response_obj.get("incomplete_details", {})
+                    if isinstance(details, dict):
+                        reason = str(details.get("reason") or "unknown")
+                        err_msg = f"incomplete response: {reason}"
+                        err_code = reason
+
+            raise UpstreamResponsesError(
+                f"Responses SSE {event_type} {err_code}: {err_msg}",
+                body=event_data,
+                response_text=data_str,
+            )
+
         return event_type, event_data
 
     def _flush_current_event() -> tuple[str, dict[str, Any]] | None:
