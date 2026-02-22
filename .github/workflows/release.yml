@@ -2,13 +2,13 @@ name: Release Plugin
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.1.6"
-        required: true
+        description: "Optional release tag, e.g. v0.1.6"
+        required: false
         type: string
 
 jobs:
@@ -20,50 +20,81 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "value=${TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Validate metadata version
+      - name: Resolve version from metadata
+        id: version
         run: |
           python3 - <<'PY'
           import pathlib
           import re
           import sys
 
-          tag = "${{ steps.tag.outputs.value }}".strip()
           metadata = pathlib.Path("metadata.yaml").read_text(encoding="utf-8")
-          m = re.search(r"^version:\s*([^\n]+)\s*$", metadata, flags=re.MULTILINE)
-          if not m:
+          match = re.search(r"^version:\s*([^\n]+)\s*$", metadata, flags=re.MULTILINE)
+          if not match:
               print("metadata.yaml 缺少 version 字段", file=sys.stderr)
               sys.exit(1)
-          version = m.group(1).strip().strip("'\"")
-          accepted = {version, f"v{version}"}
-          if tag not in accepted:
+          version = match.group(1).strip().strip("'\"")
+          if not version:
+              print("metadata.yaml version 不能为空", file=sys.stderr)
+              sys.exit(1)
+          if not re.match(r"^v?\d+\.\d+\.\d+$", version):
               print(
-                  f"Tag 与 metadata.yaml version 不一致: tag={tag}, metadata={version}",
+                  f"metadata.yaml version 必须是 x.y.z 或 vx.y.z，当前: {version}",
                   file=sys.stderr,
               )
               sys.exit(1)
-          print(f"validated tag={tag}, metadata={version}")
+          normalized = version[1:] if version.startswith("v") else version
+          tag = f"v{normalized}"
+          with pathlib.Path(".release_vars").open("w", encoding="utf-8") as fp:
+              fp.write(f"raw_version={normalized}\n")
+              fp.write(f"tag={tag}\n")
+          print(f"resolved version={normalized} tag={tag}")
           PY
+          cat .release_vars >> "$GITHUB_OUTPUT"
+
+      - name: Validate manual tag input
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+        run: |
+          INPUT_TAG="${{ inputs.tag }}"
+          INPUT_TAG="${INPUT_TAG#refs/tags/}"
+          if [[ "${INPUT_TAG}" != v* ]]; then
+            INPUT_TAG="v${INPUT_TAG}"
+          fi
+          EXPECTED_TAG="${{ steps.version.outputs.tag }}"
+          if [[ "${INPUT_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "workflow_dispatch tag 与 metadata.yaml version 不一致: input=${INPUT_TAG}, expected=${EXPECTED_TAG}"
+            exit 1
+          fi
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure tag points to current commit
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git fetch --tags origin
+          git tag -f "${TAG}" "${GITHUB_SHA}"
+          git push -f origin "refs/tags/${TAG}"
+          echo "tag ${TAG} is aligned to ${GITHUB_SHA}"
 
       - name: Build zip package
         run: |
-          TAG="${{ steps.tag.outputs.value }}"
+          TAG="${{ steps.version.outputs.tag }}"
           PKG="astrbot_plugin_openai_responses-${TAG}.zip"
           zip -r "${PKG}" . \
             -x "*.git*" \
             -x "*__pycache__*" \
             -x "*.pyc" \
             -x ".venv/*" \
+            -x ".codex/*" \
+            -x ".specify/*" \
+            -x "specs/*" \
             -x "astrbot.log" \
             -x "data/*"
           echo "PKG=${PKG}" >> "$GITHUB_ENV"
@@ -74,18 +105,25 @@ jobs:
             cp CHANGELOG.md RELEASE_NOTES.md
           else
             {
-              echo "# Release ${{ steps.tag.outputs.value }}"
+              echo "# Release ${{ steps.version.outputs.tag }}"
               echo
               echo "- 请查看仓库提交记录。"
             } > RELEASE_NOTES.md
           fi
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.value }}
-          name: ${{ steps.tag.outputs.value }}
-          body_path: RELEASE_NOTES.md
-          files: ${{ env.PKG }}
-          draft: false
-          prerelease: false
+      - name: Upsert GitHub release and upload package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PKG: ${{ env.PKG }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" \
+              --title "${TAG}" \
+              --notes-file RELEASE_NOTES.md
+          else
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "${TAG}" "${PKG}" --clobber

@@ -6,7 +6,8 @@
 ## [Unreleased]
 
 ### Changed
-- 新增发布工作流 `.github/workflows/release.yml`，用于自动创建 GitHub Release。
+- 发布工作流改为“推送 `master` 自动触发”，版本统一读取 `metadata.yaml`。
+- 当同版本 Release 已存在时，自动执行覆盖更新（更新说明并覆盖 zip 资产）。
 - 新增 `RELEASING.md`，明确 AstrBot 更新机制适配与发布约束。
 - README 补充“更新机制（AstrBot）”说明，强调可通过 WebUI 更新插件。
 
