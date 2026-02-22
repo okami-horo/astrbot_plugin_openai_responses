@@ -7,6 +7,14 @@ from typing import Any
 
 
 _PRUNE_STRATEGIES = {"pair_aware", "legacy"}
+_PROMPT_CACHE_KEY_PREFIX = "astrbot:pc:v1:"
+_PROMPT_CACHE_KEY_MAX_LEN = 64
+_PROMPT_CACHE_KEY_DIGEST_HEX_LEN = min(
+    32,
+    max(8, _PROMPT_CACHE_KEY_MAX_LEN - len(_PROMPT_CACHE_KEY_PREFIX)),
+)
+_PROMPT_CACHE_SEED_FALLBACK_MODEL = "unknown-model"
+_PROMPT_CACHE_SEED_FALLBACK_API_BASE = "unknown-api-base"
 
 
 def normalize_prune_strategy(value: Any, default: str = "pair_aware") -> str:
@@ -17,9 +25,15 @@ def normalize_prune_strategy(value: Any, default: str = "pair_aware") -> str:
     return default
 
 
-def _safe_json_dumps(value: Any) -> str:
+def _safe_json_dumps(value: Any, *, sort_keys: bool = False) -> str:
     try:
-        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=sort_keys,
+        )
     except Exception:
         return str(value)
 
@@ -40,13 +54,43 @@ class ResponsesTurnState:
         *,
         session_id: str | None,
         messages: list[dict[str, Any]],
+        model: str | None = None,
+        api_base: str | None = None,
     ) -> str:
-        if isinstance(session_id, str) and session_id.strip():
-            return f"astrbot:{session_id.strip()}"
+        normalized_session_id = (
+            session_id.strip()
+            if isinstance(session_id, str) and session_id.strip()
+            else ""
+        )
+        normalized_model = (
+            model.strip()
+            if isinstance(model, str) and model.strip()
+            else _PROMPT_CACHE_SEED_FALLBACK_MODEL
+        )
+        normalized_api_base = (
+            api_base.strip().rstrip("/")
+            if isinstance(api_base, str) and api_base.strip()
+            else _PROMPT_CACHE_SEED_FALLBACK_API_BASE
+        )
 
-        digest_source = _safe_json_dumps(messages)
-        digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:20]
-        return f"astrbot:anon:{digest}"
+        seed_payload: dict[str, Any] = {
+            "session_id": normalized_session_id,
+            "model": normalized_model,
+            "api_base": normalized_api_base,
+        }
+        if not normalized_session_id:
+            # When session_id is unavailable, include message content to reduce collisions.
+            messages_digest = hashlib.sha256(
+                _safe_json_dumps(messages, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            seed_payload["messages_digest"] = messages_digest
+
+        digest_source = _safe_json_dumps(seed_payload, sort_keys=True)
+        digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[
+            :_PROMPT_CACHE_KEY_DIGEST_HEX_LEN
+        ]
+        key = f"{_PROMPT_CACHE_KEY_PREFIX}{digest}"
+        return key[:_PROMPT_CACHE_KEY_MAX_LEN]
 
     def note_success(
         self,

@@ -599,6 +599,8 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                     else None
                 ),
                 messages=message_items,
+                model=model,
+                api_base=self.api_base,
             )
             request_body["prompt_cache_key"] = prompt_cache_key
 
@@ -706,22 +708,53 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
             response_format=response_format,
             tool_choice_override=tool_choice_override,
         )
-        processor = ResponsesStreamAccumulator(
-            model=str(payloads.get("model") or self.get_model()),
-            debug_events=self._coerce_bool(
-                self.provider_config.get("debug_sse_events", False), False
-            ),
-            max_text_chars=int(self.provider_config.get("max_output_chars", 200_000)),
-        )
+        recovered_without_prompt_cache_key = False
 
-        async for event_type, event_data in self._iter_responses_sse(
-            request_body=request_body,
-            api_key=api_key,
-        ):
-            for chunk in processor.handle_event(event_type, event_data):
-                yield chunk
+        while True:
+            processor = ResponsesStreamAccumulator(
+                model=str(payloads.get("model") or self.get_model()),
+                debug_events=self._coerce_bool(
+                    self.provider_config.get("debug_sse_events", False), False
+                ),
+                max_text_chars=int(self.provider_config.get("max_output_chars", 200_000)),
+            )
+            try:
+                async for event_type, event_data in self._iter_responses_sse(
+                    request_body=request_body,
+                    api_key=api_key,
+                ):
+                    for chunk in processor.handle_event(event_type, event_data):
+                        yield chunk
+            except Exception as exc:
+                prompt_cache_key = request_body.get("prompt_cache_key")
+                if (
+                    not recovered_without_prompt_cache_key
+                    and isinstance(prompt_cache_key, str)
+                    and self._is_prompt_cache_key_invalid(exc)
+                ):
+                    recovered_without_prompt_cache_key = True
+                    request_body = dict(request_body)
+                    request_body.pop("prompt_cache_key", None)
+                    logger.warning(
+                        "Responses request rejected prompt_cache_key, retrying once without it. "
+                        "model=%s stream=%s prompt_cache_key_len=%s",
+                        payloads.get("model"),
+                        True,
+                        len(prompt_cache_key),
+                    )
+                    continue
+                raise
 
-        yield processor.build_final_response(tools_provided=tools is not None)
+            final_response = processor.build_final_response(tools_provided=tools is not None)
+            if recovered_without_prompt_cache_key:
+                logger.info(
+                    "Responses request recovered after dropping prompt_cache_key. "
+                    "model=%s stream=%s",
+                    payloads.get("model"),
+                    True,
+                )
+            yield final_response
+            return
 
     def _finally_convert_payload(self, payloads: dict) -> None:
         for message in payloads.get("messages", []):
@@ -871,6 +904,28 @@ class ProviderOpenAIResponsesPlugin(AstrProvider):
                 if pattern in candidate:
                     return True
         return False
+
+    def _is_prompt_cache_key_invalid(self, error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        if status_code is not None and status_code != 400:
+            return False
+
+        body = getattr(error, "body", None)
+        if isinstance(body, dict):
+            err_payload = body.get("error")
+            if isinstance(err_payload, dict):
+                param = err_payload.get("param")
+                if isinstance(param, str) and param.strip() == "prompt_cache_key":
+                    return True
+                message = err_payload.get("message")
+                if isinstance(message, str) and "prompt_cache_key" in message.lower():
+                    return True
+            param = body.get("param")
+            if isinstance(param, str) and param.strip() == "prompt_cache_key":
+                return True
+
+        candidates = self._extract_error_text_candidates(error)
+        return any("prompt_cache_key" in candidate.lower() for candidate in candidates)
 
     async def _handle_api_error(
         self,

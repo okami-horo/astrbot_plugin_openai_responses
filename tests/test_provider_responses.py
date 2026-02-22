@@ -809,12 +809,130 @@ def test_build_responses_request_codex_profile_sets_instructions_and_auto_tools(
     }
 
     request = provider._build_responses_request(payloads, tools)
+    request_2 = provider._build_responses_request(payloads, tools)
 
     assert request["instructions"] == "You are Codex."
     assert request["tool_choice"] == "auto"
     assert request["parallel_tool_calls"] is True
-    assert request["prompt_cache_key"] == "astrbot:sid-1"
+    assert request["prompt_cache_key"].startswith("astrbot:pc:v1:")
+    assert len(request["prompt_cache_key"]) <= 64
+    assert request["prompt_cache_key"].isascii()
+    assert request["prompt_cache_key"] == request_2["prompt_cache_key"]
     assert request["input"][0]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_query_stream_retries_once_without_prompt_cache_key_on_param_error(
+    monkeypatch,
+):
+    provider = _make_provider(
+        overrides={
+            "api_base": "https://chatgpt.com/backend-api/codex",
+            "codex_mode": "auto",
+        }
+    )
+    payloads = {
+        "model": "gpt-5.3-codex",
+        "session_id": "sid-" + ("x" * 128),
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    try:
+        from responses_errors import UpstreamResponsesError
+    except ImportError:  # pragma: no cover
+        from data.plugins.astrbot_plugin_openai_responses.responses_errors import (
+            UpstreamResponsesError,
+        )
+
+    seen_prompt_cache_keys: list[str | None] = []
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        assert api_key == "test-key"
+        seen_prompt_cache_keys.append(request_body.get("prompt_cache_key"))
+        if len(seen_prompt_cache_keys) == 1:
+            assert isinstance(request_body.get("prompt_cache_key"), str)
+            raise UpstreamResponsesError(
+                "invalid prompt cache key",
+                status_code=400,
+                body={
+                    "error": {
+                        "message": "Invalid 'prompt_cache_key'",
+                        "param": "prompt_cache_key",
+                    }
+                },
+            )
+
+        assert "prompt_cache_key" not in request_body
+        yield (
+            "response.created",
+            {"type": "response.created", "response": {"id": "resp_1"}},
+        )
+        yield (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "ok"},
+        )
+        yield ("response.completed", {"type": "response.completed", "response": {}})
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    outputs = []
+    async for resp in provider._query_stream(payloads, None, api_key="test-key"):
+        outputs.append(resp)
+
+    assert len(seen_prompt_cache_keys) == 2
+    assert isinstance(seen_prompt_cache_keys[0], str)
+    assert seen_prompt_cache_keys[1] is None
+    assert outputs[-1].completion_text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_query_stream_does_not_retry_without_prompt_cache_key_param_error(
+    monkeypatch,
+):
+    provider = _make_provider(
+        overrides={
+            "api_base": "https://chatgpt.com/backend-api/codex",
+            "codex_mode": "auto",
+        }
+    )
+    payloads = {
+        "model": "gpt-5.3-codex",
+        "session_id": "sid-1",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    try:
+        from responses_errors import UpstreamResponsesError
+    except ImportError:  # pragma: no cover
+        from data.plugins.astrbot_plugin_openai_responses.responses_errors import (
+            UpstreamResponsesError,
+        )
+
+    attempts = 0
+
+    async def _fake_iter_responses_sse(*, request_body, api_key):
+        nonlocal attempts
+        attempts += 1
+        assert api_key == "test-key"
+        raise UpstreamResponsesError(
+            "invalid parameter",
+            status_code=400,
+            body={
+                "error": {
+                    "message": "Invalid 'model'",
+                    "param": "model",
+                }
+            },
+        )
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(provider, "_iter_responses_sse", _fake_iter_responses_sse)
+
+    with pytest.raises(UpstreamResponsesError):
+        async for _ in provider._query_stream(payloads, None, api_key="test-key"):
+            pass
+
+    assert attempts == 1
 
 
 @pytest.mark.asyncio
