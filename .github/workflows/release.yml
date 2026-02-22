@@ -1,0 +1,91 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.1.6"
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "value=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate metadata version
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          tag = "${{ steps.tag.outputs.value }}".strip()
+          metadata = pathlib.Path("metadata.yaml").read_text(encoding="utf-8")
+          m = re.search(r"^version:\s*([^\n]+)\s*$", metadata, flags=re.MULTILINE)
+          if not m:
+              print("metadata.yaml 缺少 version 字段", file=sys.stderr)
+              sys.exit(1)
+          version = m.group(1).strip().strip("'\"")
+          accepted = {version, f"v{version}"}
+          if tag not in accepted:
+              print(
+                  f"Tag 与 metadata.yaml version 不一致: tag={tag}, metadata={version}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"validated tag={tag}, metadata={version}")
+          PY
+
+      - name: Build zip package
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          PKG="astrbot_plugin_openai_responses-${TAG}.zip"
+          zip -r "${PKG}" . \
+            -x "*.git*" \
+            -x "*__pycache__*" \
+            -x "*.pyc" \
+            -x ".venv/*" \
+            -x "astrbot.log" \
+            -x "data/*"
+          echo "PKG=${PKG}" >> "$GITHUB_ENV"
+
+      - name: Prepare release notes
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            cp CHANGELOG.md RELEASE_NOTES.md
+          else
+            {
+              echo "# Release ${{ steps.tag.outputs.value }}"
+              echo
+              echo "- 请查看仓库提交记录。"
+            } > RELEASE_NOTES.md
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: ${{ steps.tag.outputs.value }}
+          body_path: RELEASE_NOTES.md
+          files: ${{ env.PKG }}
+          draft: false
+          prerelease: false

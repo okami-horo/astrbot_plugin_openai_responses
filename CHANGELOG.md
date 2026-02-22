@@ -6,7 +6,9 @@
 ## [Unreleased]
 
 ### Changed
-- 待记录
+- 新增发布工作流 `.github/workflows/release.yml`，用于自动创建 GitHub Release。
+- 新增 `RELEASING.md`，明确 AstrBot 更新机制适配与发布约束。
+- README 补充“更新机制（AstrBot）”说明，强调可通过 WebUI 更新插件。
 
 ## [0.1.6] - 2026-02-22
 
@@ -17,4 +19,3 @@
 
 ### Changed
 - 补充并强化 Codex 适配测试，覆盖缓存键稳定性、长度约束与错误自愈重试场景。
-
